@@ -1,0 +1,62 @@
+#!/usr/bin/env bash
+#
+# Run all CCC examples.  Just do:
+#
+#   ./examples/run
+#
+# You'll see CCC accept safe programs and reject buggy ones,
+# with clear error messages explaining each bug.
+#
+set -uo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+CCC_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+CCC="$CCC_ROOT/bin/ccc"
+
+# Colors (if terminal supports them)
+if [ -t 1 ]; then
+  GREEN='\033[0;32m'; RED='\033[0;31m'; BOLD='\033[1m'; DIM='\033[2m'; RESET='\033[0m'
+else
+  GREEN=''; RED=''; BOLD=''; DIM=''; RESET=''
+fi
+
+echo ""
+echo -e "${BOLD}═══════════════════════════════════════════════════${RESET}"
+echo -e "${BOLD}  CCC — Clockworks C Compiler: Example Programs${RESET}"
+echo -e "${BOLD}═══════════════════════════════════════════════════${RESET}"
+echo ""
+
+for cfile in "$SCRIPT_DIR"/[0-9]*.c; do
+  [ -f "$cfile" ] || continue
+  name="$(basename "$cfile")"
+
+  # Extract the first comment line as description
+  desc=$(head -2 "$cfile" | tail -1 | sed 's|^ \* ||; s| *$||')
+
+  echo -e "${BOLD}────────────────────────────────────────────${RESET}"
+  echo -e "${BOLD}  $name${RESET}"
+  echo -e "  ${DIM}$desc${RESET}"
+  echo -e "${BOLD}────────────────────────────────────────────${RESET}"
+  echo ""
+
+  output=$("$CCC" "$cfile" 2>&1)
+  rc=$?
+
+  echo "$output"
+  echo ""
+
+  if [ $rc -eq 0 ]; then
+    echo -e "  ${GREEN}→ ACCEPTED ✓${RESET}  (program is memory-safe)"
+  else
+    echo -e "  ${RED}→ REJECTED ✗${RESET}  (memory safety bug found)"
+  fi
+  echo ""
+done
+
+echo -e "${BOLD}═══════════════════════════════════════════════════${RESET}"
+echo -e "${BOLD}  Done. CCC caught the bugs, accepted the safe code.${RESET}"
+echo -e "${BOLD}═══════════════════════════════════════════════════${RESET}"
+echo ""
+echo "  Try editing the examples to see what CCC catches!"
+echo "  Or write your own:  ccc your_program.c"
+echo ""

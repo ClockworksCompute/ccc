@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+# ccc — Clockworks C Compiler
+# Thin wrapper that forwards to the lake-built binary.
+# Add this directory to your PATH:
+#   export PATH="/path/to/ccc/bin:$PATH"
+# Then use:  ccc myfile.c [-o output]
+set -euo pipefail
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+CCC_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+BIN="$CCC_ROOT/.lake/build/bin/ccc"
+
+if [ ! -x "$BIN" ]; then
+  echo "ccc: binary not built yet. Building..." >&2
+  (cd "$CCC_ROOT" && lake build ccc >&2)
+fi
+
+exec "$BIN" "$@"
