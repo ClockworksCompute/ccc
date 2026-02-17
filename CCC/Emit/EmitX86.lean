@@ -485,14 +485,18 @@ def roundUp16 (n : Nat) : Nat :=
   if n % 16 = 0 then n else n + (16 - (n % 16))
 
 /-- Allocate stack slots based on actual type sizes. Each slot gets
-    max(8, roundUp8(cTypeSize ty)) bytes — minimum 8 for register-width stores. -/
+    max(8, roundUp8(cTypeSize ty)) bytes — minimum 8 for register-width stores.
+    The returned offset points to the LOWEST address of the slot, so that
+    `lea offset(%rbp), %rax` gives the struct base and fields extend upward
+    within the allocated region (not above %rbp into the caller's frame). -/
 def assignOffsets (defs : List StructDef) (bindings : List (String × CType))
-    (start : Int := (-8)) : List (String × Int) :=
+    (nextFree : Int := 0) : List (String × Int) :=
   match bindings with
   | [] => []
   | (name, ty) :: rest =>
       let slotSize := max 8 (roundUp8 (cTypeSize defs ty))
-      (name, start) :: assignOffsets defs rest (start - Int.ofNat slotSize)
+      let offset := nextFree - Int.ofNat slotSize
+      (name, offset) :: assignOffsets defs rest offset
 
 
 mutual
@@ -592,14 +596,9 @@ def emitFunction (structDefs : List StructDef) (fn : FunDef) : Except String Asm
   let localBindings : TypeEnv := collectVarDecls fn.body
   let allBindings : TypeEnv := paramBindings ++ localBindings
   let offsets := assignOffsets structDefs allBindings
-  -- Frame size = sum of actual slot sizes (derived from last offset)
+  -- Frame size = distance from rbp to the lowest allocated offset
   let frameSize : Nat := match offsets.getLast? with
-    | some (_, lastOff) =>
-        let lastTy := match allBindings.getLast? with
-          | some (_, ty) => ty
-          | none => .long
-        let lastSlotSize := max 8 (roundUp8 (cTypeSize structDefs lastTy))
-        roundUp16 (Int.natAbs lastOff + lastSlotSize - 8)
+    | some (_, lastOff) => roundUp16 (Int.natAbs lastOff)
     | none => 0
   let initialState : CodegenState := {
     localOffsets := offsets

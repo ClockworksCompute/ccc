@@ -35,15 +35,17 @@ echo "Runtime: $RUNTIME"
 echo ""
 echo "Generating assembly..."
 mkdir -p .gate_staging
-lake env lean -q --run /dev/stdin <<'LEAN'
+cat > /tmp/ccc_linux_gen_asm.lean << 'LEAN'
 import CCC
 def main : IO Unit := do
-  for (name, file) in [("heartbleed_fixed", "test/demo/heartbleed_fixed.c"),
-                        ("safe_server", "test/demo/safe_server.c"),
-                        ("trivial", "INLINE:int main() { return 42; }"),
-                        ("fibonacci", "../factory/holdout/ccc/fibonacci.c")] do
-    let src ← if file.startsWith "INLINE:" then
-      pure (file.drop 7)
+  let specs : List (String × String) := [
+    ("heartbleed_fixed", "test/demo/heartbleed_fixed.c"),
+    ("safe_server", "test/demo/safe_server.c"),
+    ("trivial", "INLINE:int main() { return 42; }"),
+    ("fibonacci", "../factory/holdout/ccc/fibonacci.c")]
+  for (name, file) in specs do
+    let src : String ← if file.startsWith "INLINE:" then
+      pure (String.Slice.toString (file.drop 7))
     else
       IO.FS.readFile file
     let result := CCC.compile src s!"{name}.c"
@@ -52,6 +54,7 @@ def main : IO Unit := do
     | none => IO.eprintln s!"FAIL: {name} did not produce assembly"; IO.Process.exit 1
   IO.println "Assembly generated."
 LEAN
+lake env lean -q --run /tmp/ccc_linux_gen_asm.lean 2>&1
 [ $? -eq 0 ] || { echo "FAIL: assembly generation"; exit 1; }
 
 # Run validation in Linux container

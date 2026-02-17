@@ -6,7 +6,7 @@ Written in Lean 4. Catches Heartbleed-class bugs structurally.
 ## Versioning and Changelog
 
 - Version source of truth: [`VERSION`](./VERSION)
-- Current release: `v0.1.0`
+- Current release: `v0.1.1`
 - Release notes: [`CHANGELOG.md`](./CHANGELOG.md)
 
 ## Setup (if Lean is not installed)
