@@ -3,6 +3,12 @@
 A verified C compiler that proves memory safety at compile time.
 Written in Lean 4. Catches Heartbleed-class bugs structurally.
 
+## Versioning and Changelog
+
+- Version source of truth: [`VERSION`](./VERSION)
+- Current release: `v0.1.0`
+- Release notes: [`CHANGELOG.md`](./CHANGELOG.md)
+
 ## Setup (if Lean is not installed)
 
 CCC uses the Lean 4 toolchain (`lean` + `lake`).
@@ -433,6 +439,8 @@ This public mirror intentionally excludes internal directories:
 ├── examples/            # demo C programs + run script
 ├── test/                # demo, holdout, regression tests
 ├── docs/containers/     # runtime/container validation docs
+├── CHANGELOG.md
+├── VERSION
 ├── lakefile.lean
 └── lean-toolchain
 ```
