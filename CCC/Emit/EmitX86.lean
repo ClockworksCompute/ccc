@@ -400,12 +400,16 @@ partial def emitExpr (env : TypeEnv) (expr : Expr) : CodegenM Unit := do
       let _ <- emitLValueAddr env (.member obj field loc)
       let st <- get
       let valTy := inferExprType env st.structDefs (.member obj field loc)
-      emitLoadFromAddr valTy
+      match valTy with
+      | .array _ _ => pure ()  -- array decays to pointer; address already in %rax
+      | _ => emitLoadFromAddr valTy
   | .arrow ptr field loc =>
       let _ <- emitLValueAddr env (.arrow ptr field loc)
       let st <- get
       let valTy := inferExprType env st.structDefs (.arrow ptr field loc)
-      emitLoadFromAddr valTy
+      match valTy with
+      | .array _ _ => pure ()  -- array decays to pointer; address already in %rax
+      | _ => emitLoadFromAddr valTy
   | .call fn args _ =>
       emitCall env fn args
   | .sizeOf ty _ =>
@@ -474,15 +478,21 @@ partial def collectVarDecls (stmts : List Stmt) : List (String × CType) :=
 end
 
 
-def assignOffsets (names : List String) (start : Int := (-8)) : List (String × Int) :=
-  match names with
-  | [] => []
-  | name :: rest =>
-      (name, start) :: assignOffsets rest (start - 8)
-
+def roundUp8 (n : Nat) : Nat :=
+  if n % 8 = 0 then n else n + (8 - (n % 8))
 
 def roundUp16 (n : Nat) : Nat :=
   if n % 16 = 0 then n else n + (16 - (n % 16))
+
+/-- Allocate stack slots based on actual type sizes. Each slot gets
+    max(8, roundUp8(cTypeSize ty)) bytes — minimum 8 for register-width stores. -/
+def assignOffsets (defs : List StructDef) (bindings : List (String × CType))
+    (start : Int := (-8)) : List (String × Int) :=
+  match bindings with
+  | [] => []
+  | (name, ty) :: rest =>
+      let slotSize := max 8 (roundUp8 (cTypeSize defs ty))
+      (name, start) :: assignOffsets defs rest (start - Int.ofNat slotSize)
 
 
 mutual
@@ -581,13 +591,20 @@ def emitFunction (structDefs : List StructDef) (fn : FunDef) : Except String Asm
   let paramBindings : TypeEnv := fn.params.map (fun p => (p.name, p.ty))
   let localBindings : TypeEnv := collectVarDecls fn.body
   let allBindings : TypeEnv := paramBindings ++ localBindings
-  let offsets := assignOffsets (allBindings.map Prod.fst)
-  let frameSlots : Nat := allBindings.length
-  let frameSize : Nat := roundUp16 (frameSlots * 8)
+  let offsets := assignOffsets structDefs allBindings
+  -- Frame size = sum of actual slot sizes (derived from last offset)
+  let frameSize : Nat := match offsets.getLast? with
+    | some (_, lastOff) =>
+        let lastTy := match allBindings.getLast? with
+          | some (_, ty) => ty
+          | none => .long
+        let lastSlotSize := max 8 (roundUp8 (cTypeSize structDefs lastTy))
+        roundUp16 (Int.natAbs lastOff + lastSlotSize - 8)
+    | none => 0
   let initialState : CodegenState := {
     localOffsets := offsets
     structDefs := structDefs
-    nextOffset := -(Int.ofNat ((frameSlots + 1) * 8))
+    nextOffset := -(Int.ofNat (frameSize + 8))
     labelCounter := 0
     currentFn := fn.name
     instrs := []

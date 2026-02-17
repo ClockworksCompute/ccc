@@ -3,18 +3,33 @@
 A verified C compiler that proves memory safety at compile time.
 Written in Lean 4. Catches Heartbleed-class bugs structurally.
 
+## Setup (if Lean is not installed)
+
+CCC uses the Lean 4 toolchain (`lean` + `lake`).
+Install it once with [`elan`](https://github.com/leanprover/elan):
+
+```bash
+curl https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh -sSf | sh -s -- -y
+source "$HOME/.elan/env"
+
+lean --version
+lake --version
+```
+
+`lake` will then automatically download the exact Lean version pinned in
+`lean-toolchain`.
+
 ## Quick Start
 
 ```bash
 # Build
-cd ccc
 lake build ccc
 
 # Option 1: Use directly
 .lake/build/bin/ccc my_program.c
 
 # Option 2: Use like gcc — add to PATH
-export PATH="/path/to/ccc/bin:$PATH"
+export PATH="$(pwd)/bin:$PATH"
 ccc my_program.c                     # verify only (macOS)
 ccc my_program.c -o my_program       # verify + link (Linux x86-64)
 ```
@@ -374,11 +389,10 @@ Source (.c) → [Parser] → AST → [Verifier] → VerifiedProgram → [Emitter
 ## Building from Source
 
 Requirements:
-- Lean 4 v4.27.0 (`leanprover/lean4:v4.27.0`)
+- Lean 4 toolchain (installed via `elan`; see setup section above)
 - ~3 minutes to build on modern hardware
 
 ```bash
-cd ccc
 lake build ccc          # build the compiler
 lake build              # build everything (including tests)
 ```
@@ -398,48 +412,27 @@ lake env lean --run test/HoldoutTest.lean
 This public mirror intentionally excludes internal directories:
 
 - `claims/`
+- `bugs/`
 - `docs/bugs/`
 
 ## Project Structure
 
 ```
-ccc/
+.
 ├── CCC/
 │   ├── Syntax/          # AST, PtrState, Build helpers
-│   │   ├── AST.lean
-│   │   ├── PtrState.lean
-│   │   └── Build.lean
 │   ├── Parse/           # Tokenizer + recursive-descent parser
-│   │   ├── Token.lean
-│   │   ├── Lex.lean
-│   │   └── Parse.lean
 │   ├── Verify/          # Flow-sensitive safety verifier
-│   │   ├── FlowState.lean
-│   │   ├── TypeSize.lean
-│   │   ├── BranchAnalysis.lean
-│   │   ├── PointerSafety.lean
-│   │   ├── BoundsCheck.lean
-│   │   ├── NullCheck.lean
-│   │   ├── SymbolCheck.lean
-│   │   └── Verify.lean
 │   ├── Emit/            # Deep-embedded x86-64 code generator
-│   │   ├── X86.lean
-│   │   ├── EmitX86.lean
-│   │   ├── Runtime.lean
-│   │   └── ccc_runtime.c
 │   ├── Error/
-│   │   └── Report.lean
 │   ├── Contracts.lean   # VerifiedProgram (private mk)
 │   └── Pipeline.lean    # parse → verify → emit
-├── ccc.lean             # CLI main
+├── Main.lean            # CLI main
 ├── CCC.lean             # Root import
-├── test/
-│   ├── demo/            # 7 demo programs
-│   ├── E2EAllDemos.lean
-│   ├── HoldoutTest.lean
-│   └── run_demos.sh
-├── docs/
-│   └── containers/      # runtime/container validation docs
+├── bin/ccc              # user-friendly wrapper
+├── examples/            # demo C programs + run script
+├── test/                # demo, holdout, regression tests
+├── docs/containers/     # runtime/container validation docs
 ├── lakefile.lean
 └── lean-toolchain
 ```
