@@ -25,15 +25,15 @@ def main : IO Unit := do
     ("memcpy_computed_len", "REJECT"),
     ("free_stack_var", "REJECT"),
     -- Unsupported syntax (should REJECT)
-    ("unsupported_float", "ACCEPT"),       -- Now supported (Phase 2: parse+verify, emit panics)
+    ("unsupported_float", "REJECT"),
     ("unsupported_preprocessor", "REJECT"),
-    ("unsupported_union_goto", "REJECT"),  -- Parses but emitter panics on goto/label
-    ("unsupported_function_pointer", "ACCEPT"),  -- Now supported: parser handles function pointers
+    ("unsupported_union_goto", "REJECT"),
+    ("unsupported_function_pointer", "REJECT"),
     ("unsupported_variadic", "REJECT"),
     -- Type/semantic errors (should REJECT)
     ("typerr_undeclared_var", "REJECT"),
     ("typerr_wrong_arg_count", "REJECT"),
-    ("typerr_undefined_function", "ACCEPT"),  -- CCC44: not a memory safety violation; linker catches it
+    ("typerr_undefined_function", "REJECT"),
     ("typerr_deref_non_pointer", "REJECT"),
     ("typerr_undefined_struct", "REJECT"),
     ("typerr_bad_member_access", "REJECT"),

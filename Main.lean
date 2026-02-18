@@ -10,11 +10,7 @@ import CCC
 
 def usage : String :=
   "Usage: ccc <input.c> [-o <output>]\n" ++
-  "       ccc -c <input.c> -o <output.s>\n" ++
-  "       ccc --verify-report <input.c>\n" ++
   "  Compile a C source file with memory safety verification.\n" ++
-  "  -c: compile to assembly only (no assembling/linking).\n" ++
-  "  --verify-report: print per-function verification status.\n" ++
   "  If no -o specified, only verify (no assembly/linking)."
 
 /-- Find the runtime source file relative to the executable. -/
@@ -38,69 +34,18 @@ def commandExists (cmd : String) : IO Bool := do
   }
   return result.exitCode == 0
 
-open CCC.Syntax in
-/-- Format a SafetyProperty as a short tag. -/
-def violationTag : SafetyProperty → String
-  | .bufferBounds    => "bounds"
-  | .noUseAfterFree  => "uaf"
-  | .noDoubleFree    => "double-free"
-  | .noNullDeref     => "null-deref"
-  | .noStackOverflow => "stack-overflow"
-
-open CCC.Syntax in
-/-- Format a single FunVerifyResult as one line of verify-report output. -/
-def formatFunReport (r : FunVerifyResult) : String :=
-  let nv := r.violations.length
-  if r.status == .exempt then
-    s!"{r.funName}: exempt (uses setjmp)"
-  else if nv == 0 then
-    s!"{r.funName}: verified (0 violations)"
-  else
-    let tags := r.violations.map fun v =>
-      s!"{violationTag v.property} at line {v.loc.line}"
-    let tagStr := String.intercalate ", " tags
-    s!"{r.funName}: degraded ({nv} violations: {tagStr})"
-
-/-- Read and preprocess a source file. -/
-def readAndPreprocess (inputFile : String) : IO String := do
-  let raw ← IO.FS.readFile inputFile
-  let parts := inputFile.splitOn "/"
-  let basePath := if parts.length > 1 then
-      String.intercalate "/" (parts.dropLast)
-    else "."
-  CCC.Preprocess.preprocess raw basePath
-
 def main (args : List String) : IO UInt32 := do
-  -- Handle --verify-report mode
-  match args with
-  | ["--verify-report", inputFile] => do
-      let source ← readAndPreprocess inputFile
-      let filename := (inputFile.splitOn "/").getLast!
-      match CCC.parseSource source with
-      | .error e =>
-          IO.eprintln s!"ERROR: Parse error in {filename}:\n  {e}"
-          return 1
-      | .ok prog =>
-          let report := CCC.Verify.verifyProgramReport prog
-          -- Print per-function status, skipping the synthetic "program" entry
-          for r in report.results do
-            if r.funName != "program" then
-              IO.println (formatFunReport r)
-          return 0
-  | _ => pure ()
-
   -- Parse arguments
-  let (inputFile, outputFile, compileOnly) ← do
+  let (inputFile, outputFile) ← do
     match args with
-    | [input] => pure (input, none, false)
-    | [input, "-o", output] => pure (input, some output, false)
-    | ["-c", input, "-o", output] => pure (input, some output, true)
+    | [input] => pure (input, none)
+    | [input, "-o", output] => pure (input, some output)
     | _ =>
       IO.eprintln usage
       return 1
 
-  -- Read and preprocess source (self-contained, no gcc dependency)
-  let source ← readAndPreprocess inputFile
+  -- Read source
+  let source ← IO.FS.readFile inputFile
 
   -- Extract filename for reporting
   let filename := (inputFile.splitOn "/").getLast!
@@ -111,20 +56,12 @@ def main (args : List String) : IO UInt32 := do
   -- Print report
   IO.println result.report
 
-  -- Force-emit mode: violations no longer abort if assembly was produced.
-  -- Only exit 1 if there is no assembly at all.
-  let some asm := result.assembly | return 1
+  -- If violations found, exit 1
+  if !result.violations.isEmpty then
+    return 1
 
-  -- If compile-only mode, write assembly directly and exit
-  if compileOnly then
-    match outputFile with
-    | none =>
-      IO.eprintln "Error: -c requires -o <output.s>"
-      return 1
-    | some output =>
-      IO.FS.writeFile output asm
-      IO.println s!"Wrote assembly to {output}"
-      return 0
+  -- If no assembly produced (parse error, emit error), exit 1
+  let some asm := result.assembly | return 1
 
   -- If output requested, assemble and link
   match outputFile with

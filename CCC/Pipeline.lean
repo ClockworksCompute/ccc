@@ -20,7 +20,7 @@ structure CompileResult where
 /-- Build a ProgramVerifyResult from a flat list of violations (for error reporting). -/
 private def violationsToResult (violations : List Syntax.SafetyViolation)
     : Syntax.ProgramVerifyResult :=
-  { results := [{ funName := "program", status := .verified, violations := violations, evidence := [] }] }
+  { results := [{ funName := "program", violations := violations, evidence := [] }] }
 
 /-- Full compilation pipeline: parse → verify → emit, with formatted reporting. -/
 def compile (source : String) (filename : String) : CompileResult :=
@@ -46,18 +46,9 @@ def compile (source : String) (filename : String) : CompileResult :=
           report := s!"ERROR: Emission error in {filename}:\n  {emitErr}" }
     | .error violations =>
       let verifyResult := violationsToResult violations
-      -- Force-emit: attempt emission despite verification failures
-      let emitResult := Emit.emitProgramAArch64 prog
-      match emitResult with
-      | .ok asm =>
-        { assembly := some asm
-          verifyResult := some verifyResult
-          violations := violations
-          report := Error.formatResult verifyResult source filename }
-      | .error _ =>
-        { assembly := none
-          verifyResult := some verifyResult
-          violations := violations
-          report := Error.formatResult verifyResult source filename }
+      { assembly := none
+        verifyResult := some verifyResult
+        violations := violations
+        report := Error.formatResult verifyResult source filename }
 
 end CCC
