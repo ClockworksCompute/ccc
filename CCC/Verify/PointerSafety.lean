@@ -52,7 +52,7 @@ private def mkInvalidFreeViolation (ctx : VerifyCtx) (loc : Syntax.Loc) (expr : 
     context := [s!"function: {ctx.currentFun}"]
     suggestion := some "Only call free on heap pointers returned from malloc" }
 
-private def tyName : Syntax.CType → String
+private partial def tyName : Syntax.CType → String
   | .void => "void"
   | .int => "int"
   | .char => "char"
@@ -63,6 +63,21 @@ private def tyName : Syntax.CType → String
   | .unsigned inner => s!"unsigned {tyName inner}"
   | .array inner n => s!"{tyName inner}[{n}]"
   | .struct_ name => s!"struct {name}"
+  -- Phase 2 types
+  | .float_ => "float"
+  | .double_ => "double"
+  | .short => "short"
+  | .longLong => "long long"
+  | .signed inner => s!"signed {tyName inner}"
+  | .enum_ name => s!"enum {name}"
+  | .union_ name => s!"union {name}"
+  | .funcPtr ret params =>
+      let paramStr := String.intercalate ", " (params.map tyName)
+      s!"{tyName ret} (*)({paramStr})"
+  | .typedef_ name => name
+  | .const_ inner => s!"const {tyName inner}"
+  | .volatile_ inner => s!"volatile {tyName inner}"
+  | .restrict_ inner => s!"restrict {tyName inner}"
 
 private def mkDerefNonPointerViolation (ctx : VerifyCtx) (loc : Syntax.Loc)
     (expr : Syntax.Expr) (name : String) (ty : Syntax.CType) : Syntax.SafetyViolation :=
@@ -169,6 +184,20 @@ partial def checkExpr (ctx : VerifyCtx) (expr : Syntax.Expr) (state : FlowState)
       let s1 := checkExpr ctx lhs state
       let s2 := checkExpr ctx rhs s1
       applyAssignTransition ctx s2 lhs rhs
+  -- Phase 2 Expr
+  | .strLit _ _ | .nullLit _ | .floatLit _ _ => state
+  | .ternary c t e _ =>
+      let s1 := checkExpr ctx c state
+      let s2 := checkExpr ctx t s1
+      checkExpr ctx e s2
+  | .cast _ operand _ => checkExpr ctx operand state
+  | .comma l r _ =>
+      let s1 := checkExpr ctx l state
+      checkExpr ctx r s1
+  | .initList elems _ => elems.foldl (fun st e => checkExpr ctx e st) state
+  | .callFnPtr fn args _ =>
+      let s1 := checkExpr ctx fn state
+      args.foldl (fun st arg => checkExpr ctx arg st) s1
 
 /-- Handle declaration-level pointer state updates. -/
 def handleVarDecl (ctx : VerifyCtx) (name : String) (ty : Syntax.CType)
@@ -238,5 +267,15 @@ partial def check (ctx : VerifyCtx) (stmt : Syntax.Stmt) (state : FlowState) : F
       let bodyState := body.foldl (fun st stx => check ctx stx st) s3
       FlowState.merge s3 bodyState
   | .block stmts _ => stmts.foldl (fun st stx => check ctx stx st) state
+  -- Phase 2 Stmt
+  | .switch_ scrut cases _ =>
+      let s0 := checkExpr ctx scrut state
+      cases.foldl (fun st (_, body, _) => body.foldl (fun s stx => check ctx stx s) st) s0
+  | .doWhile body cond _ =>
+      let s1 := body.foldl (fun st stx => check ctx stx st) state
+      checkExpr ctx cond s1
+  | .break_ _ | .continue_ _ | .emptyStmt _ => state
+  | .goto_ _ _ => state
+  | .label_ _ body _ => check ctx body state
 
 end CCC.Verify.PointerSafety

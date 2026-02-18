@@ -51,6 +51,20 @@ partial def checkExpr (ctx : VerifyCtx) (expr : Syntax.Expr) (state : FlowState)
       let s1 := checkExpr ctx lhs state
       checkExpr ctx rhs s1
   | .intLit _ _ | .charLit _ _ | .var _ _ | .sizeOf _ _ => state
+  -- Phase 2 Expr
+  | .strLit _ _ | .nullLit _ | .floatLit _ _ => state
+  | .ternary c t e _ =>
+      let s1 := checkExpr ctx c state
+      let s2 := checkExpr ctx t s1
+      checkExpr ctx e s2
+  | .cast _ operand _ => checkExpr ctx operand state
+  | .comma l r _ =>
+      let s1 := checkExpr ctx l state
+      checkExpr ctx r s1
+  | .initList elems _ => elems.foldl (fun st e => checkExpr ctx e st) state
+  | .callFnPtr fn args _ =>
+      let s1 := checkExpr ctx fn state
+      args.foldl (fun st arg => checkExpr ctx arg st) s1
 
 /-- Null-dereference check entrypoint for statements. -/
 partial def check (ctx : VerifyCtx) (stmt : Syntax.Stmt) (state : FlowState) : FlowState :=
@@ -84,5 +98,15 @@ partial def check (ctx : VerifyCtx) (stmt : Syntax.Stmt) (state : FlowState) : F
         | none => s2
       body.foldl (fun st stx => check ctx stx st) s3
   | .block stmts _ => stmts.foldl (fun st stx => check ctx stx st) state
+  -- Phase 2 Stmt
+  | .switch_ scrut cases _ =>
+      let s0 := checkExpr ctx scrut state
+      cases.foldl (fun st (_, body, _) => body.foldl (fun s stx => check ctx stx s) st) s0
+  | .doWhile body cond _ =>
+      let s1 := body.foldl (fun st stx => check ctx stx st) state
+      checkExpr ctx cond s1
+  | .break_ _ | .continue_ _ | .emptyStmt _ => state
+  | .goto_ _ _ => state
+  | .label_ _ body _ => check ctx body state
 
 end CCC.Verify.NullCheck

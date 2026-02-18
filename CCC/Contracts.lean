@@ -12,6 +12,7 @@ import CCC.Syntax.PtrState
 import CCC.Parse.Parse
 import CCC.Verify.Verify
 import CCC.Emit.EmitX86
+import CCC.Emit.EmitAArch64
 
 namespace CCC
 
@@ -47,9 +48,20 @@ def verifyProgram (prog : Syntax.Program)
   else
     throw report.allViolations
 
-/-- Emitter contract. Implemented by CCC03.
-    Only accepts VerifiedProgram — verifier bypass is a type error. -/
-def emitProgram (vprog : VerifiedProgram) : Except String String :=
-  Emit.emitProgramImpl vprog.program
+/-- Target architecture detection. On Apple Silicon, use AArch64. -/
+inductive TargetArch where
+  | x86_64
+  | aarch64
+  deriving Repr, BEq
+
+def detectArch : TargetArch :=
+  -- Compile-time detection: if building on aarch64, default to it
+  -- This is a runtime default; CLI flag can override later
+  .aarch64  -- Apple Silicon is our primary dev platform
+
+def emitProgram (vprog : VerifiedProgram) (arch : TargetArch := detectArch) : Except String String :=
+  match arch with
+  | .aarch64 => Emit.emitProgramAArch64 vprog.program
+  | .x86_64  => Emit.emitProgramImpl vprog.program
 
 end CCC

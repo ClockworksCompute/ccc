@@ -85,7 +85,13 @@ def structDef (name : String) (fields : List (String × CType)) : StructDef :=
   { name, fields, loc := loc 1 }
 
 def program (structs : List StructDef := []) (fns : List FunDef) : Program :=
-  { structs, functions := fns }
+  { structs
+    unions := []
+    enums := []
+    typedefs := []
+    globals := []
+    externs := []
+    functions := fns }
 
 -- ══════════════════════════════════════════════════════════════
 -- Common patterns
