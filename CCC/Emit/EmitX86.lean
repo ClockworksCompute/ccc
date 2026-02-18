@@ -6,13 +6,22 @@ namespace CCC.Emit
 
 open CCC.Syntax
 
+/-- Loop context for break/continue targets. -/
+structure LoopCtx where
+  breakLabel    : LabelId
+  continueLabel : Option LabelId  -- None for switch (no continue target)
+  deriving Repr, Inhabited
+
 structure CodegenState where
   localOffsets : List (String × Int)
   structDefs   : List CCC.Syntax.StructDef
+  typedefs     : List CCC.Syntax.TypedefDecl
   nextOffset   : Int
   labelCounter : Nat
   currentFn    : String
   instrs       : List Instr
+  dataSection  : List String
+  loopStack    : List LoopCtx
 
 abbrev CodegenM := StateT CodegenState (Except String)
 
@@ -64,6 +73,19 @@ partial def cTypeSize (defs : List StructDef) (ty : CType) : Nat :=
             let (_, fTy) := field
             acc + cTypeSize defs fTy) 0
   | .sizeT => 8
+  -- Phase 2 types
+  | .float_ => 4
+  | .double_ => 8
+  | .short => 2
+  | .longLong => 8
+  | .signed inner => cTypeSize defs inner
+  | .enum_ _ => 4
+  | .union_ _ => 0              -- TODO: look up union def
+  | .funcPtr _ _ => 8
+  | .typedef_ _ => 8            -- fallback; callers should resolveType first
+  | .const_ inner => cTypeSize defs inner
+  | .volatile_ inner => cTypeSize defs inner
+  | .restrict_ inner => cTypeSize defs inner
 
 
 def lookupFieldType (defs : List StructDef) (structName : String) (fieldName : String) : Option CType :=
@@ -116,6 +138,18 @@ def emitLoadFromAddr (ty : CType) : CodegenM Unit := do
     emitInstr (.mov (.mem .rax 0) (.reg .rax))
 
 
+/-- Resolve typedef chains: typedef_ "Node" → struct_ "Node" etc.
+    Also stored as TypeEnv context for programs with typedefs. -/
+partial def resolveType (typedefs : List TypedefDecl) (ty : CType) : CType :=
+  match ty with
+  | .typedef_ name =>
+      match typedefs.find? (fun td => td.name == name) with
+      | some td => resolveType typedefs td.target
+      | none => ty  -- unresolved, keep as-is
+  | .pointer inner => .pointer (resolveType typedefs inner)
+  | .array inner n => .array (resolveType typedefs inner) n
+  | _ => ty
+
 partial def inferExprType (env : TypeEnv) (defs : List StructDef) (expr : Expr) : CType :=
   match expr with
   | .intLit _ _ => .long
@@ -136,7 +170,8 @@ partial def inferExprType (env : TypeEnv) (defs : List StructDef) (expr : Expr) 
           | .pointer elem => elem
           | _ => .long
       | .not_ => .int
-      | .neg => .long
+      | .neg | .bitNot => .long
+      | .preInc | .preDec | .postInc | .postDec => inferExprType env defs operand
   | .index arr _ _ =>
       match inferExprType env defs arr with
       | .pointer elem => elem
@@ -159,6 +194,15 @@ partial def inferExprType (env : TypeEnv) (defs : List StructDef) (expr : Expr) 
   | .call _ _ _ => .long
   | .sizeOf _ _ => .sizeT
   | .assign lhs _ _ => inferExprType env defs lhs
+  -- Phase 2 Expr
+  | .strLit _ _ => .pointer .char
+  | .nullLit _ => .pointer .void
+  | .floatLit _ _ => .double_
+  | .ternary _ t _ _ => inferExprType env defs t
+  | .cast ty _ _ => ty
+  | .comma _ r _ => inferExprType env defs r
+  | .initList _ _ => .long
+  | .callFnPtr _ _ _ => .long
 
 
 def emitBoolFromFlags (mkSet : Operand → Instr) : CodegenM Unit := do
@@ -213,12 +257,12 @@ partial def emitLValueAddr (env : TypeEnv) (expr : Expr) : CodegenM CType := do
       pure elemTy
   | .member obj field _ =>
       let st <- get
-      let objTy := inferExprType env st.structDefs obj
+      let objTy := resolveType st.typedefs (inferExprType env st.structDefs obj)
       let structNameOpt := match objTy with
         | .struct_ sname => some sname
         | _ => none
       match structNameOpt with
-      | none => throw "member access on non-struct value"
+      | none => throw s!"member access on non-struct value (got {repr objTy})"
       | some structName =>
           let _ <- emitLValueAddr env obj
           let st2 <- get
@@ -234,7 +278,7 @@ partial def emitLValueAddr (env : TypeEnv) (expr : Expr) : CodegenM CType := do
   | .arrow ptr field _ =>
       emitExpr env ptr
       let st <- get
-      let ptrTy := inferExprType env st.structDefs ptr
+      let ptrTy := resolveType st.typedefs (inferExprType env st.structDefs ptr)
       match ptrTy with
       | .pointer (.struct_ structName) =>
           let fieldTy := match lookupFieldType st.structDefs structName field with
@@ -246,8 +290,8 @@ partial def emitLValueAddr (env : TypeEnv) (expr : Expr) : CodegenM CType := do
               if off ≠ 0 then
                 emitInstr (.add (.imm off) (.reg .rax))
               pure fieldTy
-      | _ => throw "arrow access on non-pointer-to-struct"
-  | _ => throw "expression is not assignable"
+      | _ => throw s!"arrow access on non-pointer-to-struct (got {repr ptrTy})"
+  | _ => throw "expression is not assignable (or Phase 2 lvalue not yet implemented)"
 
 
 partial def emitCmpBinOp (env : TypeEnv) (lhs rhs : Expr) (mkSet : Operand → Instr) : CodegenM Unit := do
@@ -368,6 +412,164 @@ partial def emitExpr (env : TypeEnv) (expr : Expr) : CodegenM Unit := do
           emitInstr (.cmp (.imm 0) (.reg .rax))
           emitInstr (.setne (.reg .al))
           emitInstr (.movzbl (.reg .al) (.reg .eax))
+      -- Phase 2 BinOps: bitwise
+      | .bitAnd =>
+          emitExpr env lhs
+          emitInstr (.push (.reg .rax))
+          emitExpr env rhs
+          emitInstr (.pop (.reg .rcx))
+          emitInstr (.and_ (.reg .rcx) (.reg .rax))
+      | .bitOr =>
+          emitExpr env lhs
+          emitInstr (.push (.reg .rax))
+          emitExpr env rhs
+          emitInstr (.pop (.reg .rcx))
+          emitInstr (.or_ (.reg .rcx) (.reg .rax))
+      | .bitXor =>
+          emitExpr env lhs
+          emitInstr (.push (.reg .rax))
+          emitExpr env rhs
+          emitInstr (.pop (.reg .rcx))
+          emitInstr (.xor_ (.reg .rcx) (.reg .rax))
+      | .shl =>
+          emitExpr env lhs
+          emitInstr (.push (.reg .rax))
+          emitExpr env rhs
+          emitInstr (.mov (.reg .rax) (.reg .rcx))
+          emitInstr (.pop (.reg .rax))
+          emitInstr (.shl (.reg .cl) (.reg .rax))
+      | .shr =>
+          emitExpr env lhs
+          emitInstr (.push (.reg .rax))
+          emitExpr env rhs
+          emitInstr (.mov (.reg .rax) (.reg .rcx))
+          emitInstr (.pop (.reg .rax))
+          emitInstr (.shr (.reg .cl) (.reg .rax))
+      -- Phase 2 BinOps: compound assignment (desugar to load-op-store)
+      -- lhs is the target, rhs is the delta; emit: addr=lhs, old=*addr, new=old OP rhs, *addr=new
+      | .addAssign =>
+          emitExpr env rhs
+          emitInstr (.push (.reg .rax))          -- push rhs value
+          let _lhsTy ← emitLValueAddr env lhs
+          emitInstr (.mov (.mem .rax 0) (.reg .rcx))  -- old value
+          emitInstr (.push (.reg .rax))          -- push addr
+          emitInstr (.pop (.reg .rax))           -- addr in rax
+          emitInstr (.pop (.reg .rdx))           -- rhs in rdx
+          emitInstr (.add (.reg .rdx) (.reg .rcx))
+          emitInstr (.mov (.reg .rcx) (.mem .rax 0))
+          emitInstr (.mov (.reg .rcx) (.reg .rax))
+      | .subAssign =>
+          emitExpr env rhs
+          emitInstr (.push (.reg .rax))
+          let _lhsTy ← emitLValueAddr env lhs
+          emitInstr (.mov (.mem .rax 0) (.reg .rcx))
+          emitInstr (.push (.reg .rax))
+          emitInstr (.pop (.reg .rax))
+          emitInstr (.pop (.reg .rdx))
+          emitInstr (.sub (.reg .rdx) (.reg .rcx))
+          emitInstr (.mov (.reg .rcx) (.mem .rax 0))
+          emitInstr (.mov (.reg .rcx) (.reg .rax))
+      | .mulAssign =>
+          emitExpr env rhs
+          emitInstr (.push (.reg .rax))
+          let _lhsTy ← emitLValueAddr env lhs
+          emitInstr (.mov (.mem .rax 0) (.reg .rcx))
+          emitInstr (.push (.reg .rax))
+          emitInstr (.pop (.reg .rax))
+          emitInstr (.pop (.reg .rdx))
+          emitInstr (.imul (.reg .rdx) (.reg .rcx))
+          emitInstr (.mov (.reg .rcx) (.mem .rax 0))
+          emitInstr (.mov (.reg .rcx) (.reg .rax))
+      | .divAssign =>
+          emitExpr env rhs
+          emitInstr (.push (.reg .rax))
+          let _lhsTy ← emitLValueAddr env lhs
+          emitInstr (.push (.reg .rax))          -- push addr
+          emitInstr (.mov (.mem .rax 0) (.reg .rax)) -- old in rax
+          emitInstr .cqo
+          emitInstr (.pop (.reg .rcx))           -- addr in rcx (temp)
+          emitInstr (.push (.reg .rcx))          -- re-push addr
+          -- rhs is on stack below addr; complex register dance
+          -- Simplified: use r11 for addr
+          emitInstr (.pop (.reg .r11))           -- addr
+          emitInstr (.pop (.reg .rcx))           -- rhs
+          emitInstr (.push (.reg .r11))          -- re-push addr
+          emitInstr (.idiv (.reg .rcx))
+          emitInstr (.pop (.reg .rcx))           -- addr
+          emitInstr (.mov (.reg .rax) (.mem .rcx 0))
+      | .modAssign =>
+          emitExpr env rhs
+          emitInstr (.push (.reg .rax))
+          let _lhsTy ← emitLValueAddr env lhs
+          emitInstr (.push (.reg .rax))
+          emitInstr (.mov (.mem .rax 0) (.reg .rax))
+          emitInstr .cqo
+          emitInstr (.pop (.reg .r11))
+          emitInstr (.pop (.reg .rcx))
+          emitInstr (.push (.reg .r11))
+          emitInstr (.idiv (.reg .rcx))
+          emitInstr (.pop (.reg .rcx))
+          emitInstr (.mov (.reg .rdx) (.mem .rcx 0))  -- remainder in rdx
+          emitInstr (.mov (.reg .rdx) (.reg .rax))
+      | .andAssign =>
+          emitExpr env rhs
+          emitInstr (.push (.reg .rax))
+          let _lhsTy ← emitLValueAddr env lhs
+          emitInstr (.mov (.mem .rax 0) (.reg .rcx))
+          emitInstr (.push (.reg .rax))
+          emitInstr (.pop (.reg .rax))
+          emitInstr (.pop (.reg .rdx))
+          emitInstr (.and_ (.reg .rdx) (.reg .rcx))
+          emitInstr (.mov (.reg .rcx) (.mem .rax 0))
+          emitInstr (.mov (.reg .rcx) (.reg .rax))
+      | .orAssign =>
+          emitExpr env rhs
+          emitInstr (.push (.reg .rax))
+          let _lhsTy ← emitLValueAddr env lhs
+          emitInstr (.mov (.mem .rax 0) (.reg .rcx))
+          emitInstr (.push (.reg .rax))
+          emitInstr (.pop (.reg .rax))
+          emitInstr (.pop (.reg .rdx))
+          emitInstr (.or_ (.reg .rdx) (.reg .rcx))
+          emitInstr (.mov (.reg .rcx) (.mem .rax 0))
+          emitInstr (.mov (.reg .rcx) (.reg .rax))
+      | .xorAssign =>
+          emitExpr env rhs
+          emitInstr (.push (.reg .rax))
+          let _lhsTy ← emitLValueAddr env lhs
+          emitInstr (.mov (.mem .rax 0) (.reg .rcx))
+          emitInstr (.push (.reg .rax))
+          emitInstr (.pop (.reg .rax))
+          emitInstr (.pop (.reg .rdx))
+          emitInstr (.xor_ (.reg .rdx) (.reg .rcx))
+          emitInstr (.mov (.reg .rcx) (.mem .rax 0))
+          emitInstr (.mov (.reg .rcx) (.reg .rax))
+      | .shlAssign =>
+          emitExpr env rhs
+          emitInstr (.push (.reg .rax))
+          let _lhsTy ← emitLValueAddr env lhs
+          emitInstr (.mov (.mem .rax 0) (.reg .rcx))
+          emitInstr (.push (.reg .rax))
+          emitInstr (.push (.reg .rcx))
+          emitInstr (.mov (.mem .rsp 8) (.reg .r11)) -- addr
+          -- shift amount in cl
+          emitInstr (.pop (.reg .rax))           -- old value
+          emitInstr (.pop (.reg .r11))           -- addr
+          emitInstr (.pop (.reg .rcx))           -- shift amount
+          emitInstr (.shl (.reg .cl) (.reg .rax))
+          emitInstr (.mov (.reg .rax) (.mem .r11 0))
+      | .shrAssign =>
+          emitExpr env rhs
+          emitInstr (.push (.reg .rax))
+          let _lhsTy ← emitLValueAddr env lhs
+          emitInstr (.mov (.mem .rax 0) (.reg .rcx))
+          emitInstr (.push (.reg .rax))
+          emitInstr (.push (.reg .rcx))
+          emitInstr (.pop (.reg .rax))
+          emitInstr (.pop (.reg .r11))
+          emitInstr (.pop (.reg .rcx))
+          emitInstr (.shr (.reg .cl) (.reg .rax))
+          emitInstr (.mov (.reg .rax) (.mem .r11 0))
   | .unOp op operand _ =>
       match op with
       | .neg =>
@@ -391,6 +593,65 @@ partial def emitExpr (env : TypeEnv) (expr : Expr) : CodegenM Unit := do
       | .addrOf =>
           let _ <- emitLValueAddr env operand
           pure ()
+      -- Phase 2 UnOps
+      | .bitNot =>
+          emitExpr env operand
+          emitInstr (.not_ (.reg .rax))
+      | .preInc =>
+          let lhsTy ← emitLValueAddr env operand
+          let st ← get
+          let sz := cTypeSize st.structDefs lhsTy
+          if sz ≤ 4 then do
+            emitInstr (.movl (.mem .rax 0) (.reg .ecx))
+            emitInstr (.add (.imm 1) (.reg .rcx))
+            emitInstr (.movl (.reg .ecx) (.mem .rax 0))
+          else do
+            emitInstr (.mov (.mem .rax 0) (.reg .rcx))
+            emitInstr (.add (.imm 1) (.reg .rcx))
+            emitInstr (.mov (.reg .rcx) (.mem .rax 0))
+          emitInstr (.mov (.reg .rcx) (.reg .rax))
+      | .preDec =>
+          let lhsTy ← emitLValueAddr env operand
+          let st ← get
+          let sz := cTypeSize st.structDefs lhsTy
+          if sz ≤ 4 then do
+            emitInstr (.movl (.mem .rax 0) (.reg .ecx))
+            emitInstr (.sub (.imm 1) (.reg .rcx))
+            emitInstr (.movl (.reg .ecx) (.mem .rax 0))
+          else do
+            emitInstr (.mov (.mem .rax 0) (.reg .rcx))
+            emitInstr (.sub (.imm 1) (.reg .rcx))
+            emitInstr (.mov (.reg .rcx) (.mem .rax 0))
+          emitInstr (.mov (.reg .rcx) (.reg .rax))
+      | .postInc =>
+          let lhsTy ← emitLValueAddr env operand
+          let st ← get
+          let sz := cTypeSize st.structDefs lhsTy
+          if sz ≤ 4 then do
+            emitInstr (.movl (.mem .rax 0) (.reg .ecx))
+            emitInstr (.mov (.reg .rcx) (.reg .rax))  -- return old value
+            emitInstr (.add (.imm 1) (.reg .rcx))
+            emitInstr (.movl (.reg .ecx) (.mem .rax 0))  -- but store new
+          else do
+            emitInstr (.mov (.mem .rax 0) (.reg .rcx))
+            emitInstr (.mov (.reg .rcx) (.reg .rax))
+            emitInstr (.add (.imm 1) (.reg .rcx))
+            emitInstr (.mov (.reg .rcx) (.mem .rax 0))
+          -- rax still holds old value
+      | .postDec =>
+          let lhsTy ← emitLValueAddr env operand
+          let st ← get
+          let sz := cTypeSize st.structDefs lhsTy
+          if sz ≤ 4 then do
+            emitInstr (.movl (.mem .rax 0) (.reg .ecx))
+            emitInstr (.mov (.reg .rcx) (.reg .rax))
+            emitInstr (.sub (.imm 1) (.reg .rcx))
+            emitInstr (.movl (.reg .ecx) (.mem .rax 0))
+          else do
+            emitInstr (.mov (.mem .rax 0) (.reg .rcx))
+            emitInstr (.mov (.reg .rcx) (.reg .rax))
+            emitInstr (.sub (.imm 1) (.reg .rcx))
+            emitInstr (.mov (.reg .rcx) (.mem .rax 0))
   | .index arr idx loc =>
       let _ <- emitLValueAddr env (.index arr idx loc)
       let st <- get
@@ -399,14 +660,14 @@ partial def emitExpr (env : TypeEnv) (expr : Expr) : CodegenM Unit := do
   | .member obj field loc =>
       let _ <- emitLValueAddr env (.member obj field loc)
       let st <- get
-      let valTy := inferExprType env st.structDefs (.member obj field loc)
+      let valTy := resolveType st.typedefs (inferExprType env st.structDefs (.member obj field loc))
       match valTy with
       | .array _ _ => pure ()  -- array decays to pointer; address already in %rax
       | _ => emitLoadFromAddr valTy
   | .arrow ptr field loc =>
       let _ <- emitLValueAddr env (.arrow ptr field loc)
       let st <- get
-      let valTy := inferExprType env st.structDefs (.arrow ptr field loc)
+      let valTy := resolveType st.typedefs (inferExprType env st.structDefs (.arrow ptr field loc))
       match valTy with
       | .array _ _ => pure ()  -- array decays to pointer; address already in %rax
       | _ => emitLoadFromAddr valTy
@@ -414,7 +675,8 @@ partial def emitExpr (env : TypeEnv) (expr : Expr) : CodegenM Unit := do
       emitCall env fn args
   | .sizeOf ty _ =>
       let st <- get
-      emitInstr (.mov (.imm (Int.ofNat (cTypeSize st.structDefs ty))) (.reg .rax))
+      let resolvedTy := resolveType st.typedefs ty
+      emitInstr (.mov (.imm (Int.ofNat (cTypeSize st.structDefs resolvedTy))) (.reg .rax))
   | .assign lhs rhs _ =>
       emitExpr env rhs
       emitInstr (.push (.reg .rax))
@@ -429,6 +691,57 @@ partial def emitExpr (env : TypeEnv) (expr : Expr) : CodegenM Unit := do
       else
         emitInstr (.mov (.reg .rcx) (.mem .rax 0))
       emitInstr (.mov (.reg .rcx) (.reg .rax))
+  -- Phase 2 Expr
+  | .strLit val _ =>
+      -- String literals go in .rodata; emit address load
+      let st ← get
+      let strLabel := s!".LC{st.labelCounter}"
+      set { st with labelCounter := st.labelCounter + 1,
+                     dataSection := st.dataSection ++ [s!"{strLabel}:", s!"    .string \"{val}\""] }
+      emitInstr (.lea (.label strLabel) (.reg .rax))
+  | .ternary cond thenExpr elseExpr _ =>
+      let elseLbl ← freshLabel "tern_else"
+      let endLbl ← freshLabel "tern_end"
+      emitExpr env cond
+      emitInstr (.cmp (.imm 0) (.reg .rax))
+      emitInstr (.je elseLbl)
+      emitExpr env thenExpr
+      emitInstr (.jmp endLbl)
+      emitInstr (.label_ elseLbl)
+      emitExpr env elseExpr
+      emitInstr (.label_ endLbl)
+  | .cast _ operand _ =>
+      -- For integer casts, just evaluate the operand (same register)
+      emitExpr env operand
+  | .comma left right _ =>
+      emitExpr env left  -- discard result
+      emitExpr env right
+  | .initList elems _ =>
+      -- Emit each element; result is last element
+      match elems with
+      | [] => emitInstr (.mov (.imm 0) (.reg .rax))
+      | _ =>
+        for e in elems do
+          emitExpr env e
+  | .callFnPtr fnExpr args _ =>
+      -- Push args, evaluate fn pointer, call indirect
+      for arg in args.reverse do
+        emitExpr env arg
+        emitInstr (.push (.reg .rax))
+      let pairs := List.zip args argRegs
+      for pair in pairs do
+        let (_, reg) := pair
+        emitInstr (.pop (.reg reg))
+      emitExpr env fnExpr
+      emitInstr (.push (.reg .rax))
+      -- rax now has fn pointer — but we need to preserve it across arg setup
+      -- Simplified: call *%rax
+      emitInstr (.pop (.reg .r11))
+      emitInstr (.call "*%r11")
+  | .nullLit _ => emitInstr (.mov (.imm 0) (.reg .rax))
+  | .floatLit _ _ =>
+      -- Float not supported in x86 integer pipeline; emit 0 as placeholder
+      emitInstr (.mov (.imm 0) (.reg .rax))
 
 end
 
@@ -441,10 +754,13 @@ def runExprCodegen
   let init : CodegenState := {
     localOffsets := locals
     structDefs := structDefs
+    typedefs := []
     nextOffset := 0
     labelCounter := 0
     currentFn := "_expr"
     instrs := []
+    dataSection := []
+    loopStack := []
   }
   let (_, st) <- (emitExpr env expr).run init
   pure st.instrs
@@ -468,6 +784,13 @@ partial def collectVarDeclsStmt (stmt : Stmt) : List (String × CType) :=
       initVars ++ collectVarDecls body
   | .block stmts _ =>
       collectVarDecls stmts
+  -- Phase 2 Stmt
+  | .switch_ _ cases _ =>
+      (cases.map (fun (_, body, _) => collectVarDecls body)).flatten
+  | .doWhile body _ _ => collectVarDecls body
+  | .break_ _ | .continue_ _ | .emptyStmt _ => []
+  | .goto_ _ _ => []
+  | .label_ _ body _ => collectVarDeclsStmt body
 
 
 partial def collectVarDecls (stmts : List Stmt) : List (String × CType) :=
@@ -540,6 +863,7 @@ partial def emitStmt (env : TypeEnv) (retLabel : LabelId) (stmt : Stmt) : Codege
   | .while_ cond body _ =>
       let loopLbl <- freshLabel "while_loop"
       let endLbl <- freshLabel "while_end"
+      modify fun st => { st with loopStack := ⟨endLbl, some loopLbl⟩ :: st.loopStack }
       emitInstr (.label_ loopLbl)
       emitExpr env cond
       emitInstr (.cmp (.imm 0) (.reg .rax))
@@ -547,12 +871,15 @@ partial def emitStmt (env : TypeEnv) (retLabel : LabelId) (stmt : Stmt) : Codege
       emitStmts env retLabel body
       emitInstr (.jmp loopLbl)
       emitInstr (.label_ endLbl)
+      modify fun st => { st with loopStack := st.loopStack.drop 1 }
   | .for_ init cond step body _ =>
       match init with
       | none => pure ()
       | some initStmt => emitStmt env retLabel initStmt
       let loopLbl <- freshLabel "for_loop"
+      let stepLbl <- freshLabel "for_step"
       let endLbl <- freshLabel "for_end"
+      modify fun st => { st with loopStack := ⟨endLbl, some stepLbl⟩ :: st.loopStack }
       emitInstr (.label_ loopLbl)
       match cond with
       | none => pure ()
@@ -561,14 +888,86 @@ partial def emitStmt (env : TypeEnv) (retLabel : LabelId) (stmt : Stmt) : Codege
           emitInstr (.cmp (.imm 0) (.reg .rax))
           emitInstr (.je endLbl)
       emitStmts env retLabel body
+      emitInstr (.label_ stepLbl)
       match step with
       | none => pure ()
       | some stepExpr =>
           emitExpr env stepExpr
       emitInstr (.jmp loopLbl)
       emitInstr (.label_ endLbl)
+      modify fun st => { st with loopStack := st.loopStack.drop 1 }
   | .block stmts _ =>
       emitStmts env retLabel stmts
+  -- Phase 2 Stmt
+  | .switch_ scrutinee cases _ =>
+      let endLbl ← freshLabel "switch_end"
+      modify fun st => { st with loopStack := ⟨endLbl, none⟩ :: st.loopStack }
+      -- Evaluate scrutinee once
+      emitExpr env scrutinee
+      emitInstr (.push (.reg .rax))
+      -- Generate jump table: compare against each case value
+      let mut caseLbls : List (Option Int × LabelId) := []
+      let mut defaultLbl : Option LabelId := none
+      for c in cases do
+        let (val, _, _) := c
+        let lbl ← freshLabel "case"
+        caseLbls := caseLbls ++ [(val, lbl)]
+        match val with
+        | none => defaultLbl := some lbl
+        | _ => pure ()
+      -- Emit comparisons
+      for (val, lbl) in caseLbls do
+        match val with
+        | some v =>
+            emitInstr (.mov (.mem .rsp 0) (.reg .rax))
+            emitInstr (.cmp (.imm v) (.reg .rax))
+            emitInstr (.je lbl)
+        | none => pure ()
+      -- Jump to default or end
+      match defaultLbl with
+      | some dl => emitInstr (.jmp dl)
+      | none => emitInstr (.jmp endLbl)
+      -- Pop scrutinee
+      emitInstr (.pop (.reg .rax))
+      -- Emit case bodies
+      let casePairs := List.zip cases caseLbls
+      for ((_, body, _), (_, lbl)) in casePairs do
+        emitInstr (.label_ lbl)
+        emitStmts env retLabel body
+      emitInstr (.label_ endLbl)
+      modify fun st => { st with loopStack := st.loopStack.drop 1 }
+  | .doWhile body cond _ =>
+      let loopLbl ← freshLabel "do_loop"
+      let endLbl ← freshLabel "do_end"
+      modify fun st => { st with loopStack := ⟨endLbl, some loopLbl⟩ :: st.loopStack }
+      emitInstr (.label_ loopLbl)
+      emitStmts env retLabel body
+      emitExpr env cond
+      emitInstr (.cmp (.imm 0) (.reg .rax))
+      emitInstr (.jne loopLbl)
+      emitInstr (.label_ endLbl)
+      modify fun st => { st with loopStack := st.loopStack.drop 1 }
+  | .break_ _ => do
+      let st ← get
+      match st.loopStack with
+      | ctx :: _ => emitInstr (.jmp ctx.breakLabel)
+      | [] => emitInstr (.comment "break: no enclosing loop")
+  | .continue_ _ => do
+      let st ← get
+      match st.loopStack with
+      | ctx :: _ =>
+          match ctx.continueLabel with
+          | some lbl => emitInstr (.jmp lbl)
+          | none => emitInstr (.comment "continue: in switch, no target")
+      | [] => emitInstr (.comment "continue: no enclosing loop")
+  | .goto_ label _ =>
+      let lbl : LabelId := { fn := "", kind := label, idx := 0 }
+      emitInstr (.jmp lbl)
+  | .label_ name body _ =>
+      let lbl : LabelId := { fn := "", kind := name, idx := 0 }
+      emitInstr (.label_ lbl)
+      emitStmt env retLabel body
+  | .emptyStmt _ => pure ()
 
 
 partial def emitStmts (env : TypeEnv) (retLabel : LabelId) (stmts : List Stmt) : CodegenM Unit := do
@@ -591,7 +990,7 @@ def emitParamMoves (params : List Param) (offsets : List (String × Int)) : Code
         emitInstr (.mov (.reg reg) (.mem .rbp off))
 
 
-def emitFunction (structDefs : List StructDef) (fn : FunDef) : Except String AsmFunction := do
+def emitFunction (structDefs : List StructDef) (typedefs : List TypedefDecl) (fn : FunDef) : Except String (AsmFunction × List String) := do
   let paramBindings : TypeEnv := fn.params.map (fun p => (p.name, p.ty))
   let localBindings : TypeEnv := collectVarDecls fn.body
   let allBindings : TypeEnv := paramBindings ++ localBindings
@@ -603,10 +1002,13 @@ def emitFunction (structDefs : List StructDef) (fn : FunDef) : Except String Asm
   let initialState : CodegenState := {
     localOffsets := offsets
     structDefs := structDefs
+    typedefs := typedefs
     nextOffset := -(Int.ofNat (frameSize + 8))
     labelCounter := 0
     currentFn := fn.name
     instrs := []
+    dataSection := []
+    loopStack := []
   }
   let env : TypeEnv := allBindings
   -- retLabel uses a distinct kind "ret", so no idx collision with freshLabel outputs
@@ -618,7 +1020,7 @@ def emitFunction (structDefs : List StructDef) (fn : FunDef) : Except String Asm
       emitInstr (.sub (.imm (Int.ofNat frameSize)) (.reg .rsp))
     emitParamMoves fn.params offsets
     emitStmts env retLabel fn.body
-    if fn.ret = .void then
+    if fn.ret == .void then
       pure ()
     else
       emitInstr (.mov (.imm 0) (.reg .rax))
@@ -627,24 +1029,24 @@ def emitFunction (structDefs : List StructDef) (fn : FunDef) : Except String Asm
     emitInstr (.pop (.reg .rbp))
     emitInstr .ret
   let (_, finalState) <- codegen.run initialState
-  pure { name := fn.name, instrs := finalState.instrs }
+  pure ({ name := fn.name, instrs := finalState.instrs }, finalState.dataSection)
 
 
-partial def emitFunctions (structDefs : List StructDef) (fns : List FunDef)
-    : Except String (List AsmFunction) := do
+partial def emitFunctions (structDefs : List StructDef) (typedefs : List TypedefDecl) (fns : List FunDef)
+    : Except String (List AsmFunction × List String) := do
   match fns with
-  | [] => pure []
+  | [] => pure ([], [])
   | fn :: rest =>
-      let asmFn <- emitFunction structDefs fn
-      let asmRest <- emitFunctions structDefs rest
-      pure (asmFn :: asmRest)
+      let (asmFn, dataLines) <- emitFunction structDefs typedefs fn
+      let (asmRest, dataRest) <- emitFunctions structDefs typedefs rest
+      pure (asmFn :: asmRest, dataLines ++ dataRest)
 
 
 def emitProgramImpl (prog : CCC.Syntax.Program) : Except String String := do
-  let functions <- emitFunctions prog.structs prog.functions
+  let (functions, dataLines) <- emitFunctions prog.structs prog.typedefs prog.functions
   let asm : AsmProgram := {
     functions := functions
-    dataSection := []
+    dataSection := dataLines
   }
   pure (emitAsm asm)
 

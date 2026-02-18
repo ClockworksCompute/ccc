@@ -43,6 +43,11 @@ inductive Instr where
   | idiv (src : Operand)
   | cmp (src dst : Operand)
   | xor_ (src dst : Operand)
+  | and_ (src dst : Operand)
+  | or_ (src dst : Operand)
+  | not_ (dst : Operand)
+  | shl (src dst : Operand)      -- shift left (src=cl or imm)
+  | shr (src dst : Operand)      -- shift right (src=cl or imm)
   | push (src : Operand)
   | pop (dst : Operand)
   | call (target : String)
@@ -132,6 +137,11 @@ def Instr.toATT : Instr → String
   | .idiv src => s!"    idivq {src.toATT}"
   | .cmp src dst => s!"    cmpq {src.toATT}, {dst.toATT}"
   | .xor_ src dst => s!"    xorq {src.toATT}, {dst.toATT}"
+  | .and_ src dst => s!"    andq {src.toATT}, {dst.toATT}"
+  | .or_ src dst => s!"    orq {src.toATT}, {dst.toATT}"
+  | .not_ dst => s!"    notq {dst.toATT}"
+  | .shl src dst => s!"    shlq {src.toATT}, {dst.toATT}"
+  | .shr src dst => s!"    shrq {src.toATT}, {dst.toATT}"
   | .push src => s!"    pushq {src.toATT}"
   | .pop dst => s!"    popq {dst.toATT}"
   | .call target => s!"    call {target}"

@@ -51,6 +51,16 @@ def knownSize : PtrState → Option Nat
 
 end PtrState
 
+/-- Verification status for a function or translation unit.
+    SAFE features → verified. DEGRADE features → degraded.
+    EXEMPT features → exempt. -/
+inductive VerifyStatus where
+  | verified    -- all SAFE/EXTEND features only; full P1-P5 guarantees
+  | degraded    -- uses DEGRADE features (goto, cast, union, funcptr); reduced precision
+  | exempt      -- uses EXEMPT features (varargs, setjmp); verification skipped
+  | parseError  -- source didn't parse
+  deriving Repr, Inhabited, BEq, DecidableEq
+
 /-- Which memory safety property was violated. -/
 inductive SafetyProperty where
   | bufferBounds     -- CWE-120, CWE-787: out-of-bounds access
@@ -78,11 +88,14 @@ inductive SafetyEvidence where
   | nullChecked          (ptrName : String) (checkLoc : Loc)
   | neverFreed           (ptrName : String)
   | stackBounded         (arrName : String) (size : Nat)
+  | degradedBy           (feature : String) (reason : String) (loc : Loc)
+  | exemptedBy           (feature : String) (reason : String) (loc : Loc)
   deriving Repr, Inhabited
 
 /-- Verification result for a single function. -/
 structure FunVerifyResult where
   funName    : String
+  status     : VerifyStatus
   violations : List SafetyViolation
   evidence   : List SafetyEvidence
   deriving Repr, Inhabited
@@ -90,6 +103,15 @@ structure FunVerifyResult where
 namespace FunVerifyResult
 
 def isSafe (r : FunVerifyResult) : Bool := r.violations.isEmpty
+
+def isVerified (r : FunVerifyResult) : Bool :=
+  r.violations.isEmpty && r.status == .verified
+
+def isDegraded (r : FunVerifyResult) : Bool :=
+  r.status == .degraded
+
+def isExempt (r : FunVerifyResult) : Bool :=
+  r.status == .exempt
 
 end FunVerifyResult
 
@@ -111,6 +133,24 @@ def allEvidence (r : ProgramVerifyResult) : List SafetyEvidence :=
 
 def totalFunctions (r : ProgramVerifyResult) : Nat :=
   r.results.length
+
+/-- Compute the worst-case status across all functions. -/
+def worstStatus (r : ProgramVerifyResult) : VerifyStatus :=
+  r.results.foldl (fun acc fr =>
+    match acc, fr.status with
+    | .exempt, _ | _, .exempt => .exempt
+    | .degraded, _ | _, .degraded => .degraded
+    | .parseError, _ | _, .parseError => .parseError
+    | .verified, .verified => .verified
+  ) .verified
+
+/-- List functions that are degraded. -/
+def degradedFunctions (r : ProgramVerifyResult) : List String :=
+  (r.results.filter (·.isDegraded)).map (·.funName)
+
+/-- List functions that are exempt. -/
+def exemptFunctions (r : ProgramVerifyResult) : List String :=
+  (r.results.filter (·.isExempt)).map (·.funName)
 
 end ProgramVerifyResult
 

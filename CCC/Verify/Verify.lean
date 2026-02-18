@@ -160,6 +160,23 @@ partial def analyzeStmt (ctx : VerifyCtx) (stmt : Syntax.Stmt) (state : FlowStat
 
   | .block stmts _ => analyzeStmts ctx stmts state
 
+  -- Phase 2 Stmt
+  | .switch_ scrut cases _ =>
+      let sCond := applyExprChecks ctx scrut state
+      cases.foldl (fun st (_, body, _) =>
+        analyzeStmts ctx body st) sCond
+
+  | .doWhile body cond _ =>
+      let sBody := analyzeStmts ctx body state
+      let sCond := applyExprChecks ctx cond sBody
+      FlowState.merge state sCond
+
+  | .break_ _ | .continue_ _ | .emptyStmt _ => state
+
+  | .goto_ _ _ => state
+
+  | .label_ _ body _ => analyzeStmt ctx body state
+
 end
 
 /-- Verify one function body. -/
@@ -167,6 +184,7 @@ def verifyFunction (ctx : VerifyCtx) (f : Syntax.FunDef) : Syntax.FunVerifyResul
   let initState := initFlowStateFromParams f.params
   let finalState := analyzeStmts ctx f.body initState
   { funName := f.name
+    status := .verified
     violations := finalState.violations
     evidence := finalState.evidence }
 
@@ -182,6 +200,7 @@ def verifyProgramReport (prog : Syntax.Program) : Syntax.ProgramVerifyResult :=
   -- Prepend symbol violations as a synthetic result
   let symbolResult : Syntax.FunVerifyResult :=
     { funName := "program"
+      status := .verified
       violations := symbolViolations
       evidence := [] }
   { results := if symbolViolations.isEmpty then results

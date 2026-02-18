@@ -77,6 +77,15 @@ partial def exprType? (ctx : VerifyCtx) (state : FlowState) (expr : Syntax.Expr)
       | .eq | .ne | .lt | .gt | .le | .ge | .and_ | .or_ => some .bool
       | _ => some .int
   | .assign lhs _ _ => exprType? ctx state lhs
+  -- Phase 2 Expr
+  | .strLit _ _ => some (.pointer .char)
+  | .nullLit _ => some (.pointer .void)
+  | .floatLit _ _ => some .double_
+  | .ternary _ t _ _ => exprType? ctx state t
+  | .cast ty _ _ => some ty
+  | .comma _ r _ => exprType? ctx state r
+  | .initList _ _ => none
+  | .callFnPtr _ _ _ => none
 
 private def arrayCapacityElems? (ctx : VerifyCtx) (state : FlowState)
     (arrExpr : Syntax.Expr) : Option Nat :=
@@ -201,6 +210,20 @@ partial def checkExpr (ctx : VerifyCtx) (expr : Syntax.Expr) (state : FlowState)
   | .assign lhs rhs _ =>
       let s1 := checkExpr ctx lhs state
       checkExpr ctx rhs s1
+  -- Phase 2 Expr
+  | .strLit _ _ | .nullLit _ | .floatLit _ _ => state
+  | .ternary c t e _ =>
+      let s1 := checkExpr ctx c state
+      let s2 := checkExpr ctx t s1
+      checkExpr ctx e s2
+  | .cast _ operand _ => checkExpr ctx operand state
+  | .comma l r _ =>
+      let s1 := checkExpr ctx l state
+      checkExpr ctx r s1
+  | .initList elems _ => elems.foldl (fun st e => checkExpr ctx e st) state
+  | .callFnPtr fn args _ =>
+      let s1 := checkExpr ctx fn state
+      args.foldl (fun st arg => checkExpr ctx arg st) s1
 
 /-- Statement-level bounds check entrypoint. -/
 partial def check (ctx : VerifyCtx) (stmt : Syntax.Stmt) (state : FlowState) : FlowState :=
@@ -239,5 +262,15 @@ partial def check (ctx : VerifyCtx) (stmt : Syntax.Stmt) (state : FlowState) : F
       let bodyState := body.foldl (fun st stx => check ctx stx st) s3
       FlowState.merge s3 bodyState
   | .block stmts _ => stmts.foldl (fun st stx => check ctx stx st) state
+  -- Phase 2 Stmt
+  | .switch_ scrut cases _ =>
+      let s0 := checkExpr ctx scrut state
+      cases.foldl (fun st (_, body, _) => body.foldl (fun s stx => check ctx stx s) st) s0
+  | .doWhile body cond _ =>
+      let s1 := body.foldl (fun st stx => check ctx stx st) state
+      checkExpr ctx cond s1
+  | .break_ _ | .continue_ _ | .emptyStmt _ => state
+  | .goto_ _ _ => state
+  | .label_ _ body _ => check ctx body state
 
 end CCC.Verify.BoundsCheck
