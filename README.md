@@ -31,8 +31,8 @@ ERROR: Memory safety violation at line 30:
 1 memory safety violation(s) found. Compilation aborted.
 ```
 
-Add a bounds check — the same one-line fix that would have prevented
-Heartbleed — and CCC accepts it:
+Add a bounds check — the same fix that would have prevented Heartbleed —
+and CCC accepts it:
 
 ```
 $ ccc examples/07_heartbleed_fixed.c
@@ -44,8 +44,7 @@ $ ccc examples/07_heartbleed_fixed.c
   ✓ Verified: 07_heartbleed_fixed (assembly generated)
 ```
 
-There are 7 example programs in [`examples/`](./examples). Run them all with
-`./examples/run`.
+There are 7 example programs in [`examples/`](./examples).
 
 ## Quick Start
 
@@ -57,9 +56,11 @@ source "$HOME/.elan/env"
 # Build
 lake build ccc
 
-# Try it — verify a program, compile it, run it
+# Run all 7 examples — CCC accepts the safe ones, rejects the buggy ones
+./examples/run
+
+# Compile a verified program to a native binary
 ./.lake/build/bin/ccc test/demo/safe_server.c -o /tmp/safe_server
-/tmp/safe_server
 ```
 
 `lake` fetches the exact Lean version pinned in `lean-toolchain` automatically.
