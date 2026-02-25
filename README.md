@@ -106,8 +106,8 @@ just tracks it through the control flow. Any code path that tries to call
 `emitProgram` without going through this branch won't type-check.
 
 The rest of the compiler is ordinary functional programming: pattern matching,
-monads, recursive descent. Lean 4 compiles to native C and is fast enough to
-build real compilers.
+monads, recursive descent. The dependent types only show up at this one
+critical boundary.
 
 ## What it checks
 
