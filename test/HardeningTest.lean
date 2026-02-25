@@ -1,5 +1,5 @@
 /-
-  test/HardeningTest.lean — EPIC-CCC42: Emitter hardening tests
+  test/HardeningTest.lean — Emitter hardening tests
 
   Tests: global variables, force-emit through violations, extern function calls.
   Compile C → AArch64 assembly → assemble → link → run → check exit code.
@@ -68,7 +68,7 @@ def main : IO UInt32 := do
   let mut total : Nat := 0
 
   IO.println "═══════════════════════════════════════════"
-  IO.println "  EPIC-CCC42: Emitter Hardening Tests"
+  IO.println "  Emitter Hardening Tests"
   IO.println "═══════════════════════════════════════════"
 
   -- ═══════════════════════════════════════════

@@ -40,15 +40,14 @@ for cfile in "$SCRIPT_DIR"/[0-9]*.c; do
   echo ""
 
   output=$("$CCC" "$cfile" 2>&1)
-  rc=$?
 
   echo "$output"
   echo ""
 
-  if [ $rc -eq 0 ]; then
-    echo -e "  ${GREEN}→ ACCEPTED ✓${RESET}  (program is memory-safe)"
-  else
+  if echo "$output" | grep -q "Compilation aborted"; then
     echo -e "  ${RED}→ REJECTED ✗${RESET}  (memory safety bug found)"
+  else
+    echo -e "  ${GREEN}→ ACCEPTED ✓${RESET}  (program is memory-safe)"
   fi
   echo ""
 done

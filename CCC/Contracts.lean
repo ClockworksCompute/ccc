@@ -1,8 +1,6 @@
 /-
   CCC/Contracts.lean — Module API contracts (canonical)
 
-  Source of truth: factory/docs/design/CCC_CANONICAL_CONTRACT.md
-
   VerifiedProgram has private constructor — emitter cannot accept unverified Program.
   Construction flows through CCC.VerifierOnly.mkVerified with proof evidence.isSafe = true.
 -/

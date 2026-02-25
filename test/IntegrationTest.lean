@@ -1,5 +1,5 @@
 /-
-  test/IntegrationTest.lean — EPIC-CCC43: Integration tests
+  test/IntegrationTest.lean — Integration tests
 
   15+ progressively harder E2E tests.
   C source → preprocess → parse → verify → emit AArch64 → as → cc → run → check exit code.
@@ -119,7 +119,7 @@ def main : IO UInt32 := do
   let mut total : Nat := 0
 
   IO.println "═══════════════════════════════════════════════════"
-  IO.println "  EPIC-CCC43: Integration — Real Programs Compile"
+  IO.println "  Integration — Real Programs Compile"
   IO.println "═══════════════════════════════════════════════════"
   IO.println ""
   IO.println "── Tier 1: Basics ──"

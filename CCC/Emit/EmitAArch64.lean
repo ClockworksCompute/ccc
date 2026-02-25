@@ -76,23 +76,32 @@ def emitAddOrSubImm (rd : ArmReg) (rn : ArmReg) (off : Int) : ArmCodegenM Unit :
   else
     emitArmInstr (.sub_imm rd rn (-off))
 
-/-- Load from [x29, #off] with correct size instruction -/
+/-- Load from [x29, #off] with correct size instruction.
+    When |off| > 255, use scratch x9 to materialise the address first
+    (AArch64 unscaled load/store only supports [-256, 255]). -/
 def emitLoadLocal (off : Int) (sz : Nat) : ArmCodegenM Unit := do
-  if sz = 1 then
-    emitArmInstr (.ldrb .x0 .x29 off)
-  else if sz ≤ 4 then
-    emitArmInstr (.ldr_w .x0 .x29 off)
+  if off.natAbs > 255 then
+    emitAddOrSubImm .x9 .x29 off
+    if sz = 1 then      emitArmInstr (.ldrb .x0 .x9 0)
+    else if sz ≤ 4 then emitArmInstr (.ldr_w .x0 .x9 0)
+    else                 emitArmInstr (.ldr .x0 .x9 0)
   else
-    emitArmInstr (.ldr .x0 .x29 off)
+    if sz = 1 then      emitArmInstr (.ldrb .x0 .x29 off)
+    else if sz ≤ 4 then emitArmInstr (.ldr_w .x0 .x29 off)
+    else                 emitArmInstr (.ldr .x0 .x29 off)
 
-/-- Store to [x29, #off] with correct size instruction -/
+/-- Store to [x29, #off] with correct size instruction.
+    When |off| > 255, use scratch x9 to materialise the address first. -/
 def emitStoreLocal (reg : ArmReg) (off : Int) (sz : Nat) : ArmCodegenM Unit := do
-  if sz = 1 then
-    emitArmInstr (.strb reg .x29 off)
-  else if sz ≤ 4 then
-    emitArmInstr (.str_w reg .x29 off)
+  if off.natAbs > 255 then
+    emitAddOrSubImm .x9 .x29 off
+    if sz = 1 then      emitArmInstr (.strb reg .x9 0)
+    else if sz ≤ 4 then emitArmInstr (.str_w reg .x9 0)
+    else                 emitArmInstr (.str reg .x9 0)
   else
-    emitArmInstr (.str reg .x29 off)
+    if sz = 1 then      emitArmInstr (.strb reg .x29 off)
+    else if sz ≤ 4 then emitArmInstr (.str_w reg .x29 off)
+    else                 emitArmInstr (.str reg .x29 off)
 
 /-- Load value from address in x0 based on type -/
 def emitArmLoadFromAddr (ty : CType) : ArmCodegenM Unit := do

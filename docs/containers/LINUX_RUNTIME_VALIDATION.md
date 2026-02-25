@@ -81,12 +81,12 @@ done'
 | malloc/free | 7 | 7 | ✅ | Heap allocation + runtime |
 | struct (int fields) | 7 | 7 | ✅ | Stack struct, field access |
 | struct pointer passing | 7 | 7 | ✅ | Cross-function struct* |
-| **struct + char array** | 3 | **segfault** | ❌ | CCC-BUG-003 |
-| **heartbleed_fixed** | 13 | **segfault** | ❌ | CCC-BUG-003 |
-| **safe_server** | 2 | **segfault** | ❌ | CCC-BUG-003 |
+| **struct + char array** | 3 | **segfault** | ❌ | struct-with-inline-array codegen bug |
+| **heartbleed_fixed** | 13 | **segfault** | ❌ | struct-with-inline-array codegen bug |
+| **safe_server** | 2 | **segfault** | ❌ | struct-with-inline-array codegen bug |
 
 Root cause: emitter dereferences inline array field base address as a pointer
-(`movq (%rax), %rax` instead of using `%rax` directly). See `CCC-BUG-003`.
+(`movq (%rax), %rax` instead of using `%rax` directly). See `struct-with-inline-array codegen bug`.
 
 ## Architecture notes
 

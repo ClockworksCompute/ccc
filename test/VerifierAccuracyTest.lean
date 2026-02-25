@@ -1,5 +1,5 @@
 /-
-  test/VerifierAccuracyTest.lean — EPIC-CCC44: Verifier false positive elimination
+  test/VerifierAccuracyTest.lean — Verifier false-positive elimination
 
   Tests that function prototypes (from #include or forward declarations) flow
   through the parser into prog.externs, and the verifier no longer produces

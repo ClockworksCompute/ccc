@@ -41,8 +41,7 @@ def main : IO Unit := do
   let specs : List (String × String) := [
     ("heartbleed_fixed", "test/demo/heartbleed_fixed.c"),
     ("safe_server", "test/demo/safe_server.c"),
-    ("trivial", "INLINE:int main() { return 42; }"),
-    ("fibonacci", "../factory/holdout/ccc/fibonacci.c")]
+    ("trivial", "INLINE:int main() { return 42; }")]
   for (name, file) in specs do
     let src : String ← if file.startsWith "INLINE:" then
       pure (String.Slice.toString (file.drop 7))

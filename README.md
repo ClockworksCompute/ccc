@@ -1,8 +1,25 @@
 # CCC — Clockworks C Compiler
 
-CCC is a Lean 4 C frontend/compiler with built-in static safety analysis.
+CCC is a C compiler written in [Lean 4](https://lean-lang.org/) with built-in
+static memory-safety analysis.
 
-It runs a full pipeline:
+### Why Lean 4?
+
+Lean is a dependently-typed language best known as an interactive theorem prover.
+CCC uses it as a regular programming language — but the type system gives us one
+key property that's hard to get elsewhere: the code emitter **cannot be called on
+an unverified program**. `VerifiedProgram` (see `CCC/Contracts.lean`) has a
+private constructor that requires a proof term `evidence.isSafe = true`. The
+parser returns a `Program`, the verifier either promotes it to `VerifiedProgram`
+(with proof) or rejects it with violations — and the emitter's type signature
+only accepts `VerifiedProgram`. This is enforced at compile time by Lean's type
+checker, not by convention or runtime assertions.
+
+Lean 4 compiles to native C code and is fast enough to build real compilers.
+CCC's full pipeline compiles and runs 22 integration programs end-to-end on
+AArch64 (Apple Silicon).
+
+### Pipeline
 
 ```
 source.c → preprocess → parse → verify → emit assembly → (optional) as/cc link
@@ -15,7 +32,7 @@ integration/program-compatibility work can continue while safety gaps are visibl
 ## Versioning and Changelog
 
 - Version source of truth: [`VERSION`](./VERSION)
-- Current release: `v0.1.1`
+- Current release: `v0.1.2`
 - Release notes: [`CHANGELOG.md`](./CHANGELOG.md)
 
 ## Setup (if Lean is not installed)
@@ -65,16 +82,14 @@ ccc --verify-report <input.c>
 
 ## What CCC Can Do Today (validated)
 
-These are from the current test suites in `ccc/test`:
+These are from the current test suites in `test/`:
 
 - **Phase-2 feature acceptance:** `37/37` (`test/Phase2Features.lean`)
 - **Preprocessor:** `14/14` (`test/PreprocessTest.lean`)
 - **Typedef resolution:** `10/10` (`test/TypedefTest.lean`)
 - **Integration programs:** `22/22` (`test/IntegrationTest.lean`)
 - **AArch64 backend execution:** `34/34` (`test/AArch64Test.lean`)
-- **Lua 5.4 parse parity:** `34/34 files` (`test/LuaScoreTest.lean`)
 - **Emitter hardening:** `8/8` (`test/HardeningTest.lean`)
-- **Holdout suite:** `24/24` (`test/HoldoutTest.lean`)
 - **Verifier false-positive guard:** `10/10` (`test/VerifierAccuracyTest.lean`)
 
 ## Safety Analysis
@@ -113,6 +128,11 @@ integration suites, including:
 - pointers/structs: address/deref, `.` and `->`, struct/array access patterns
 - preprocessing: `#include`, macro define/undef, conditionals, include guards
 
+**Known limitations:** `union` types and `float`/`double` are parsed but not
+fully supported in the emitter (will panic at codegen). Variadic functions and
+function pointers are partially supported. This is a proof-of-concept — see
+the test suites for the validated feature surface.
+
 ## Architecture / Backend Status
 
 - Primary emitted backend in current pipeline: **AArch64** (`EmitAArch64`),
@@ -129,7 +149,6 @@ lake build ccc
 
 # Safety + compatibility suites
 lake env lean --run test/E2EAllDemos.lean
-lake env lean --run test/HoldoutTest.lean
 lake env lean --run test/Phase2Features.lean
 lake env lean --run test/PreprocessTest.lean
 lake env lean --run test/TypedefTest.lean
@@ -139,9 +158,6 @@ lake env lean --run test/VerifierAccuracyTest.lean
 lake env lean --run test/AArch64Test.lean
 lake env lean --run test/IntegrationTest.lean
 lake env lean --run test/HardeningTest.lean
-
-# Lua parse parity gate (expects Lua source in /tmp/lua-5.4.7/src)
-lake env lean --run test/LuaScoreTest.lean
 ```
 
 ## Public Repository Notes
@@ -167,7 +183,7 @@ This public mirror intentionally excludes internal directories:
 │   ├── Contracts.lean
 │   └── Pipeline.lean
 ├── Main.lean            # CLI entry
-├── test/                # integration, backend, holdout, regression suites
+├── test/                # integration, backend, and regression suites
 ├── examples/            # demo programs
 ├── CHANGELOG.md
 ├── VERSION
