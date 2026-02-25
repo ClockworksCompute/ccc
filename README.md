@@ -71,28 +71,39 @@ prover. CCC uses it as a systems programming language — but the type system
 gives us one property that would be hard to enforce in C++ or Rust:
 
 ```lean
--- CCC/Contracts.lean
+-- The emitter only accepts VerifiedProgram, which has a private constructor.
+-- You can't create one without a proof that the verifier passed.
 
 structure VerifiedProgram where
-  private mk ::                              -- private constructor
+  private mk ::
   program  : Syntax.Program
   evidence : Syntax.ProgramVerifyResult
 
-def mkVerified (prog : Syntax.Program)
-    (evidence : Syntax.ProgramVerifyResult)
-    (_h : evidence.isSafe = true)            -- proof obligation
-    : VerifiedProgram := ...
+def mkVerified (prog    : Syntax.Program)
+               (evidence : Syntax.ProgramVerifyResult)
+               (_h      : evidence.isSafe = true)       -- proof required
+    : VerifiedProgram := { program := prog, evidence := evidence }
 
-def emitProgram (vprog : VerifiedProgram)    -- only accepts VerifiedProgram
-    : Except String String := ...
+def emitProgram (vprog : VerifiedProgram) : Except String String := ...
 ```
 
-`VerifiedProgram` has a **private constructor**. The only way to create one is
-through `mkVerified`, which requires a **proof term** that `evidence.isSafe =
-true`. The emitter's type signature only accepts `VerifiedProgram`. This means
-the Lean compiler itself statically rejects any code path where assembly could
-be emitted for an unverified program — not by convention, not by runtime
-assertion, but by the type checker.
+Where does the proof come from? It falls out of a normal `if` check — no
+manual proof writing, no tactic blocks:
+
+```lean
+def verifyProgram (prog : Syntax.Program) : ... := do
+  let report := Verify.verifyProgramReport prog
+  if h : report.isSafe then                -- `h` is now a proof that isSafe = true
+    return mkVerified prog report h        -- proof passed to constructor
+  else
+    throw report.allViolations             -- no VerifiedProgram possible here
+```
+
+`if h : expr then` is Lean's *dependent if*. When `expr` evaluates to `true`
+at runtime, `h` becomes a compile-time proof of `expr = true` in the `then`
+branch. So the runtime boolean check **is** the proof — the type checker
+just tracks it through the control flow. Any code path that tries to call
+`emitProgram` without going through this branch won't type-check.
 
 The rest of the compiler is ordinary functional programming: pattern matching,
 monads, recursive descent. Lean 4 compiles to native C and is fast enough to
