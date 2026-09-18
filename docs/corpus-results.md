@@ -1,6 +1,73 @@
 # CVE regression corpus — baseline results
 
-## 2026-09-19 (update) — measured after the FEL-40..49 verifier fixes
+## 2026-09-19 (second update) — after FEL-59 (real --harden), the div-by-zero
+## check, and the typedef-struct-field parser fix
+
+**Against commit:** `13649a043f75aa1a8ff6b9ac4a2df4347e24217b` (branch
+`epic/libheif-class-detection`).
+
+```
+ENTRY                              VULN        FIXED       CLASS            NOTES
+--------------------------------------------------------------------------------------------
+libheif-overlay-85e21ad            rejected    rejected    false-positive   fixed.c flagged at line 130
+libpng-cve-2015-8126               rejected    rejected    false-positive   fixed.c flagged at line 52
+libpng-cve-2018-13785              rejected    rejected    false-positive   fixed.c flagged at line 26
+libwebp-cve-2023-4863              accepted    accepted    missed           bug not flagged
+--------------------------------------------------------------------------------------------
+
+SUMMARY: 4 entries -- detected=0 missed=1 false-positive=3 parse-failed=0 timeout=0
+```
+
+Still 0/4 strictly *detected*. What changed since the update immediately
+below this one:
+
+- **`libpng-cve-2018-13785` moved from `missed` to `false-positive`.** A
+  new, sound division-by-zero check (a tractable, self-contained slice of
+  FEL-56 — this entry's bug is pure integer arithmetic, no pointer or
+  interprocedural complexity at all) now flags `vulnerable.c`'s
+  `row_factor` division directly — the actual CVE. `fixed.c` is also
+  flagged: its `row_factor` is widened to `size_t` and provably nonzero
+  in reality (`product + 1 + ...`, and 1 makes any non-negative sum
+  positive), but proving that needs "sum of non-negative terms plus a
+  positive literal is positive" reasoning this pass doesn't implement, so
+  it isn't recognized as safe yet. Real, verified progress (the
+  previously-invisible bug is now visible) short of the full "detected"
+  bar.
+- **`libwebp-cve-2023-4863` moved from `parse-failed` to `missed`.** Fixed
+  a real, independently-significant, previously-unknown parser bug found
+  while testing this corpus entry: `typedef struct HuffmanCode { ... }
+  HuffmanCode;` (a struct typedef'd under its own tag name — extremely
+  common in real C) had its field list silently discarded by the parser,
+  so ANY value of the type failed at code emission with "unknown field"
+  the instant a field was touched — nothing to do with this CVE's actual
+  bug. Fixed at the parser level (now parses fields exactly like a bare
+  `struct NAME {...};` already did). The file now parses, verifies, and
+  compiles cleanly for both versions — but the actual OOB write (a
+  computed index into a `HuffmanCode` array) isn't caught by the verifier
+  yet, so this is a `missed`, not yet a `detected`.
+- **`libheif-overlay-85e21ad` and `libpng-cve-2015-8126` unchanged**
+  (still `false-positive`, same underlying reasons as the update below).
+
+Also landed alongside this measurement, not visible in the scoreboard
+table itself but directly relevant to the epic's Definition of Done:
+**`ccc --harden` now does real, verified runtime instrumentation**, not
+just a plumbed-through escape hatch. Every array subscript through a
+pointer-typed base gets a runtime bounds check (a new allocation-size
+registry in `runtime/ccc_runtime.c` + `ccc_check_index`, inserted by the
+emitter only when `--harden` is passed). Confirmed against the actual DoD
+acceptance test: `ccc --harden test/corpus/libheif-overlay-85e21ad/vulnerable.c`
+aborts at runtime with the real bounds violation (reading past the
+overlay plane, exactly the CVE's overflow) on the corpus's trigger input;
+the `fixed.c` version runs clean under the same `--harden` build. See
+`test/HardenTest.lean` (5/5) and Linear FEL-59 for the full story,
+including what building this uncovered: a real, previously-unknown,
+independently-significant emitter bug (`resolveType` not stripping
+`const`/`volatile`/`restrict` before checking for a typedef, silently
+corrupting the indexing stride of every `const uint8_t *`-shaped access —
+found because `--harden`'s runtime check fired on a memory-safe access
+in `fixed.c` with a visibly wrong `elem_size`).
+
+## 2026-09-19 (first update) — measured after the FEL-40..49 verifier fixes
 
 **Against commit:** `a1e70438e097713bfed3a8db998d86478ec0866f` (branch
 `epic/libheif-class-detection`, after the force-emit removal, range/bounds
