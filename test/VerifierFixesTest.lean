@@ -256,6 +256,46 @@ def main : IO UInt32 := do
     "int main() { int x = 10; return x / 3; }"
   then pass := pass + 1
 
+  -- Parser: `typedef struct NAME { ... } NAME;` (a struct typedef'd under
+  -- its own tag name -- extremely common in real C, e.g. libwebp's
+  -- HuffmanCode) previously had its field list silently discarded, so any
+  -- value of the type failed emission with "unknown field" the moment a
+  -- field was accessed. Compiles and RUNS this (not just checking the
+  -- verifier's violation count) since the original bug was an emission
+  -- failure, not a verification one.
+  total := total + 1
+  do
+    let src :=
+      "typedef struct Pair { int a; int b; } Pair;\n" ++
+      "int main() {\n" ++
+      "  Pair p;\n" ++
+      "  p.a = 17;\n" ++
+      "  p.b = 25;\n" ++
+      "  return p.a + p.b;\n}\n"
+    let pp ← preprocess src "."
+    let result := CCC.compile pp "typedef_struct_test.c"
+    match result.assembly with
+    | none => IO.eprintln s!"✗ FEL55_typedef_struct_own_name_fields: no assembly: {result.report}"
+    | some asm =>
+        let asmPath := "/tmp/ccc_vf_typedef_struct.s"
+        let objPath := "/tmp/ccc_vf_typedef_struct.o"
+        let binPath := "/tmp/ccc_vf_typedef_struct"
+        IO.FS.writeFile asmPath asm
+        let asOut ← IO.Process.output { cmd := "as", args := #["-o", objPath, asmPath] }
+        if asOut.exitCode != 0 then
+          IO.eprintln s!"✗ FEL55_typedef_struct_own_name_fields: assembler error:\n{asOut.stderr}"
+        else
+          let ccOut ← IO.Process.output { cmd := "cc", args := #["-o", binPath, objPath] }
+          if ccOut.exitCode != 0 then
+            IO.eprintln s!"✗ FEL55_typedef_struct_own_name_fields: linker error:\n{ccOut.stderr}"
+          else
+            let runOut ← IO.Process.output { cmd := binPath, args := #[] }
+            if runOut.exitCode == 42 then
+              IO.println s!"✓ FEL55_typedef_struct_own_name_fields: exit {runOut.exitCode} (expected 42)"
+              pass := pass + 1
+            else
+              IO.eprintln s!"✗ FEL55_typedef_struct_own_name_fields: exit {runOut.exitCode}, expected 42"
+
   IO.println s!"\n═══ Results: {pass}/{total} passed ═══"
   if pass == total then
     IO.println "All verifier-fixes regression tests passed!"

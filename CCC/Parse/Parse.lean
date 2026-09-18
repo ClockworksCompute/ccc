@@ -10,6 +10,12 @@ structure ParseState where
   typedefNames : List String := []
   pendingGlobals : List GlobalDecl := []
   pendingExterns : List ExternDecl := []
+  -- Struct field lists discovered while parsing `typedef struct NAME
+  -- { ... } ALIAS;` — previously this shape's body was skipped entirely
+  -- (no fields ever reached `prog.structs`), so `lookupFieldType`/
+  -- `lookupFieldOffset` failed with "unknown field" for any value of a
+  -- struct declared this way, an extremely common real-world C pattern.
+  pendingStructs : List StructDef := []
   lastParamsVariadic : Bool := false
   deriving Repr
 
@@ -1277,12 +1283,31 @@ partial def parseTypedefDecl : Parser TypedefDecl := do
       else pure none
     let tok3 ← currentToken
     if tok3.kind == .lbrace then
-      -- Skip the body { ... }
       let _ ← advance
-      skipBraceContent 1
-      let ty := if tok.kind == .kw_struct then CType.struct_ (tagName.getD "_anon")
-        else if tok.kind == .kw_union then CType.union_ (tagName.getD "_anon")
-        else CType.enum_ (tagName.getD "_anon")
+      let structName := tagName.getD "_anon"
+      if tok.kind == .kw_struct then
+        -- Actually parse the field list (previously skipped outright —
+        -- see the `pendingStructs` docstring above) so this struct has a
+        -- real entry in `prog.structs`, exactly as a bare
+        -- `struct NAME { ... };` (parsed via `parseStructDef`) already
+        -- gets. Same recovery-on-failure shape as `parseStructDef`.
+        let saved ← get
+        let fields ← do
+          let result := (parseStructFields []).run saved
+          match result with
+          | (.ok fs, st') => set st'; pure fs
+          | (.error _, _) => set saved; skipBraceContent 1; pure []
+        let tokAfterFields ← currentToken
+        if tokAfterFields.kind == .rbrace then let _ ← advance else pure ()
+        modify fun st => { st with pendingStructs :=
+          { name := structName, fields := fields, loc := startTok.loc } :: st.pendingStructs }
+      else
+        -- Union/enum inline-typedef bodies: unchanged (still skipped —
+        -- out of scope for this fix, see FEL-55).
+        skipBraceContent 1
+      let ty := if tok.kind == .kw_struct then CType.struct_ structName
+        else if tok.kind == .kw_union then CType.union_ structName
+        else CType.enum_ structName
       let finalTy ← parsePointerSuffix ty
       let (name, _) ← expectIdent
       let _ ← expectKind .semi "';'"
@@ -1347,7 +1372,11 @@ partial def parseTopLevelItem (tl : TopLevel) : Parser (Option TopLevel) := do
   | .eof => pure none
   | .kw_typedef =>
       let td ← parseTypedefDecl
-      pure (some { tl with typedefs := td :: tl.typedefs })
+      let st ← get
+      let newStructs := st.pendingStructs
+      modify fun s => { s with pendingStructs := [] }
+      pure (some { tl with typedefs := td :: tl.typedefs
+                           structs := newStructs ++ tl.structs })
   | .kw_enum =>
       let ed ← parseEnumDef
       pure (some { tl with enums := ed :: tl.enums })
