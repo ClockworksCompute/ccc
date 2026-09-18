@@ -1,0 +1,63 @@
+Trigger values hardcoded in main() of both vulnerable.c and fixed.c:
+
+  canvas (destination plane): out_w = 20, out_h = 16, out_stride = out_w  (320 bytes allocated)
+  overlay (source plane):     in_w  = 16, in_h  = 16, in_stride  = in_w  (256 bytes allocated)
+  dx = -10
+  dy = 0
+
+What "trigger" means here:
+  main() is a synthetic harness standing in for the real call site
+  (heif_image_extend_padded_size_to() -> ... -> HeifPixelImage::overlay(),
+  reached while decoding an 'iovl' image-overlay box during HEIC/AVIF
+  decode). In the real library:
+    - out_w/out_h/out_stride and in_w/in_h/in_stride come from the
+      already-decoded base image and overlay image (their pixel plane
+      sizes), not directly from attacker bytes, but the *overlay placement*
+      is:
+    - dx, dy are the two signed 32-bit integers read directly out of the
+      'iovl' box (via readvec_signed() in image-items/overlay.cc) -- this is
+      the actual attacker-controlled input. Any negative dx (overlay placed
+      partially off the left edge of the canvas) or negative dy (off the
+      top edge) drives the buggy clipping path in vulnerable.c.
+
+  dx = -10 with in_w = 16 means "10 of the overlay's 16 columns hang off the
+  left edge of the canvas, 6 should remain visible." In vulnerable.c, the
+  buggy right-border check re-derives in_w as out_w + 10 = 30 (instead of
+  leaving it at the correctly-clipped 6), so the copy loop iterates 30
+  columns starting at source column in_x0 = 10 into a 16-wide overlay
+  buffer (reads up to column 39, buffer only has columns 0..15) and, if the
+  canvas were narrower still, would also write past the canvas row.
+
+  Confirmed with AddressSanitizer (see repo scripts, or run directly):
+    cc -fsanitize=address -g vulnerable.c -o /tmp/v && /tmp/v
+      -> heap-buffer-overflow READ of size 1, 0 bytes after the 256-byte
+         overlay ("in_p") allocation, in overlay_vulnerable(), triggered
+         from main()'s hardcoded dx=-10 call.
+    cc -fsanitize=address -g fixed.c -o /tmp/f && /tmp/f
+      -> exits 0, no sanitizer report.
+
+  dy is left at 0 for this trigger (a vertical-only analog of the same bug
+  exists for dy < 0, since the pre-fix code has the identical mixed
+  signed/unsigned pattern for the bottom-border clip).
+
+CCC-specific notes (why the files look slightly simplified vs. a literal
+port, and what CCC actually does with them today):
+  - Neither file calls free() on out_p/in_p. CCC's verifier does not yet
+    relate a non-constant malloc() size (out_w*out_h here) to pointer
+    liveness (tracked as FEL-47); calling free() on such a pointer is
+    currently rejected as "not known to be heap-live" regardless of
+    whether the file is actually safe. That's a real, separate, already
+    known gap -- including free() here would make this entry's scoreboard
+    verdict about that instead of about the overlay bounds bug.
+  - overlay_vulnerable()/overlay_fixed() take 8 parameters (stride folded
+    into width) rather than 10, because CCC's AArch64 backend currently
+    caps function calls at 8 arguments (register-passed only, no
+    stack-passed args) and errors with "too many arguments" above that --
+    an unrelated codegen limitation, not part of the bug under test.
+  - As of this writing, `.lake/build/bin/ccc vulnerable.c` and
+    `.lake/build/bin/ccc fixed.c` both print "0 memory safety violations"
+    / "Verified" -- i.e. CCC currently ACCEPTS both files (the overlay
+    bounds bug is MISSED, as expected: no integer-overflow tracking, no
+    relational bounds, and the pointer arithmetic here is exactly the
+    "unrooted deref" shape FEL-44 describes as unchecked). See
+    docs/corpus-results.md for the dated baseline.

@@ -174,6 +174,35 @@ lake env lean --run test/VerifierAccuracyTest.lean # 10/10 — false-positive gu
 lake env lean --run test/E2EAllDemos.lean          # demo programs
 ```
 
+### CVE corpus
+
+`test/corpus/` is a small, growing regression corpus of real-world CVE
+shapes (libheif's overlay heap overflow behind the hacktron.ai "Hacking
+OpenAI" writeup, libwebp CVE-2023-4863, libpng CVE-2015-8126 and
+CVE-2018-13785), each ported to standalone C with a `vulnerable.c` /
+`fixed.c` pair and verified independently to actually crash under
+AddressSanitizer pre-fix and run clean post-fix. `scripts/corpus.sh` runs
+`ccc` against every entry and prints a `detected` / `missed` /
+`false-positive` / `parse-failed` / `timeout` scoreboard; run it any time
+with:
+
+```bash
+lake build ccc
+scripts/corpus.sh
+```
+
+Baseline status (see [`docs/corpus-results.md`](./docs/corpus-results.md)
+for the full writeup): **0 of 4 entries detected.** Two (`libheif-overlay-85e21ad`,
+`libpng-cve-2018-13785`) are **missed** — `ccc` accepts the vulnerable
+version outright, since the verifier does not yet track integer overflow
+or treat computed pointer/array offsets as anything but unchecked. The
+other two (`libpng-cve-2015-8126`, `libwebp-cve-2023-4863`) are
+**false-positive** — `ccc` rejects the vulnerable version, but rejects the
+fixed version identically, unable to relate a runtime clamp/bounds check
+to the buffer it protects. This is not a typo or an oversight — the
+corpus exists precisely to make that number improve (or regress)
+measurably as the verifier changes, not to claim it's already good.
+
 ## Project structure
 
 ```
