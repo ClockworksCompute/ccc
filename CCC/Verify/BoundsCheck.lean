@@ -10,6 +10,7 @@ private def exprName (expr : Syntax.Expr) : String :=
   | .member (.var obj _) field _ => obj ++ "." ++ field
   | _ => reprStr expr
 
+/-- Access-path key used to look up / update tracked range facts. -/
 private def boundKeyFromExpr? (expr : Syntax.Expr) : Option String :=
   match expr with
   | .var name _ => some name
@@ -23,6 +24,12 @@ private def intLitNat? (expr : Syntax.Expr) : Option Nat :=
       if v < 0 then none else some v.toNat
   | _ => none
 
+private def isUnsignedTy (ty : Syntax.CType) : Bool :=
+  match ty with
+  | .unsigned _ => true
+  | .sizeT => true
+  | _ => false
+
 private def mkBoundsViolation (ctx : VerifyCtx) (loc : Syntax.Loc) (expr : Syntax.Expr)
     (message : String) : Syntax.SafetyViolation :=
   { property := .bufferBounds
@@ -32,14 +39,14 @@ private def mkBoundsViolation (ctx : VerifyCtx) (loc : Syntax.Loc) (expr : Synta
     context := [s!"function: {ctx.currentFun}"]
     suggestion := some "Add or strengthen bounds checks before this access" }
 
-private def mkMemcpyViolation (ctx : VerifyCtx) (loc : Syntax.Loc) (expr : Syntax.Expr)
-    (message : String) : Syntax.SafetyViolation :=
+private def mkBufSinkViolation (ctx : VerifyCtx) (loc : Syntax.Loc) (expr : Syntax.Expr)
+    (fnName : String) (message : String) (suggestion : String) : Syntax.SafetyViolation :=
   { property := .bufferBounds
     loc := loc
     expr := reprStr expr
     message := message
-    context := [s!"function: {ctx.currentFun}", "builtin: memcpy"]
-    suggestion := some "Prove len is bounded by both source and destination buffer sizes" }
+    context := [s!"function: {ctx.currentFun}", s!"builtin: {fnName}"]
+    suggestion := some suggestion }
 
 partial def exprType? (ctx : VerifyCtx) (state : FlowState) (expr : Syntax.Expr)
     : Option Syntax.CType :=
@@ -87,6 +94,32 @@ partial def exprType? (ctx : VerifyCtx) (state : FlowState) (expr : Syntax.Expr)
   | .initList _ _ => none
   | .callFnPtr _ _ _ => none
 
+-- ══════════════════════════════════════════════════════════════
+-- Range resolution for indices / lengths (FEL-46: signed, with lower
+-- bounds, replacing the old Nat-only "exclusive upper bound" scheme).
+-- ══════════════════════════════════════════════════════════════
+
+/-- Best-known range for an expression: a resolvable literal/arithmetic value
+    collapses to a point range; otherwise fall back to whatever range is
+    tracked for its access-path key. -/
+private def idxKnownRange (ctx : VerifyCtx) (state : FlowState) (idx : Syntax.Expr) : IRange :=
+  match resolveExprInt ctx idx with
+  | some v => IRange.point v
+  | none =>
+      match boundKeyFromExpr? idx with
+      | some key => (state.getRange key).getD IRange.unknown
+      | none => IRange.unknown
+
+/-- Is this index/length provably non-negative? Prefers a known lower bound;
+    falls back to the declared type being unsigned. -/
+private def idxLoOk (ctx : VerifyCtx) (state : FlowState) (idx : Syntax.Expr) (r : IRange) : Bool :=
+  if r.knownNonNeg then true
+  else if r.knownNeg then false
+  else
+    match exprType? ctx state idx with
+    | some ty => isUnsignedTy ty
+    | none => false
+
 private def arrayCapacityElems? (ctx : VerifyCtx) (state : FlowState)
     (arrExpr : Syntax.Expr) : Option Nat :=
   match arrExpr with
@@ -107,26 +140,18 @@ private def arrayCapacityElems? (ctx : VerifyCtx) (state : FlowState)
       | some (.array _ n) => some n
       | _ => none
 
-private def indexBoundExclusive? (state : FlowState) (idxExpr : Syntax.Expr) : Option Nat :=
-  match intLitNat? idxExpr with
-  | some n => some (n + 1)
-  | none =>
-      match boundKeyFromExpr? idxExpr with
-      | some key => state.getBound key
-      | none => none
-
+/-- Signed-aware length resolution used by the memcpy-shaped sinks: `none`
+    means "cannot verify" (including a length we can prove may be negative,
+    which is at least as dangerous as an over-long length once cast to
+    `size_t`). -/
 private def lengthBoundInclusive? (ctx : VerifyCtx) (state : FlowState)
     (lenExpr : Syntax.Expr) : Option Nat :=
-  match intLitNat? lenExpr with
-  | some n => some n
-  | none =>
-      match boundKeyFromExpr? lenExpr with
-      | some key =>
-          match state.getBound key with
-          | some b =>
-              if b = 0 then some 0 else some (b - 1)
-          | none => none
-      | none => resolveExprNat ctx lenExpr
+  let r := idxKnownRange ctx state lenExpr
+  if !(idxLoOk ctx state lenExpr r) then none
+  else
+    match r.hi with
+    | some hiExcl => if hiExcl ≤ 0 then some 0 else some (hiExcl - 1).toNat
+    | none => none
 
 private def bufferSizeBytes? (ctx : VerifyCtx) (state : FlowState)
     (expr : Syntax.Expr) : Option Nat :=
@@ -148,26 +173,41 @@ private def bufferSizeBytes? (ctx : VerifyCtx) (state : FlowState)
 private def checkIndexAccess (ctx : VerifyCtx) (arr idx fullExpr : Syntax.Expr)
     (loc : Syntax.Loc) (state : FlowState) : FlowState :=
   match arrayCapacityElems? ctx state arr with
+  | none => state
   | some cap =>
-      match indexBoundExclusive? state idx with
-      | some idxBound =>
-          if idxBound ≤ cap then
-            match intLitNat? idx with
-            | some staticIdx =>
-                state.addEvidence (.staticBounds (exprName arr) cap staticIdx)
-            | none =>
-                state.addEvidence (.dynamicBoundsChecked (exprName arr) loc)
-          else
+      let r := idxKnownRange ctx state idx
+      if !(idxLoOk ctx state idx r) then
+        state.addViolation
+          (mkBoundsViolation ctx loc fullExpr
+            "Index may be negative (cannot verify a non-negative lower bound)")
+      else
+        match r.hi with
+        | some idxBoundExclusive =>
+            if idxBoundExclusive ≤ Int.ofNat cap then
+              match resolveExprInt ctx idx with
+              | some v =>
+                  if v ≥ 0 then
+                    state.addEvidence (.staticBounds (exprName arr) cap v.toNat)
+                  else
+                    state.addEvidence (.dynamicBoundsChecked (exprName arr) loc)
+              | none => state.addEvidence (.dynamicBoundsChecked (exprName arr) loc)
+            else
+              state.addViolation
+                (mkBoundsViolation ctx loc fullExpr
+                  s!"Index may exceed array bounds (capacity={cap}, required<{idxBoundExclusive})")
+        | none =>
             state.addViolation
               (mkBoundsViolation ctx loc fullExpr
-                s!"Index may exceed array bounds (capacity={cap}, required<{idxBound})")
-      | none =>
-          state.addViolation
-            (mkBoundsViolation ctx loc fullExpr
-              "Cannot verify dynamic index is within bounds")
-  | none => state
+                "Cannot verify dynamic index is within bounds")
 
-private def checkMemcpyCall (ctx : VerifyCtx) (dst src len fullExpr : Syntax.Expr)
+-- ══════════════════════════════════════════════════════════════
+-- Known-sink table (FEL-45): memcpy/memmove/memset/strncpy/snprintf checked
+-- like memcpy against the destination (and source, where relevant);
+-- strcpy/strcat accepted only when the source is a literal that provably
+-- fits; sprintf/gets always flagged as inherently unboundable.
+-- ══════════════════════════════════════════════════════════════
+
+private def checkCopyCall (ctx : VerifyCtx) (fnName : String) (dst src len fullExpr : Syntax.Expr)
     (loc : Syntax.Loc) (state : FlowState) : FlowState :=
   match bufferSizeBytes? ctx state dst, bufferSizeBytes? ctx state src with
   | some dstSize, some srcSize =>
@@ -177,22 +217,165 @@ private def checkMemcpyCall (ctx : VerifyCtx) (dst src len fullExpr : Syntax.Exp
             state.addEvidence (.dynamicBoundsChecked (exprName dst) loc)
           else
             state.addViolation
-              (mkMemcpyViolation ctx loc fullExpr
-                s!"memcpy length {lenInc} exceeds buffer size (dst={dstSize}, src={srcSize})")
+              (mkBufSinkViolation ctx loc fullExpr fnName
+                s!"{fnName} length {lenInc} exceeds buffer size (dst={dstSize}, src={srcSize})"
+                "Prove len is bounded by both source and destination buffer sizes")
       | none =>
           state.addViolation
-            (mkMemcpyViolation ctx loc fullExpr
-              s!"Cannot verify memcpy length against buffers (dst={dstSize}, src={srcSize})")
+            (mkBufSinkViolation ctx loc fullExpr fnName
+              s!"Cannot verify {fnName} length against buffers (dst={dstSize}, src={srcSize})"
+              "Prove len is bounded by both source and destination buffer sizes")
   | _, _ => state
 
-/-- Bounds checks over expressions (array index + memcpy). -/
+private def checkSingleBufLenCall (ctx : VerifyCtx) (fnName : String) (dst len fullExpr : Syntax.Expr)
+    (loc : Syntax.Loc) (state : FlowState) : FlowState :=
+  match bufferSizeBytes? ctx state dst with
+  | some dstSize =>
+      match lengthBoundInclusive? ctx state len with
+      | some lenInc =>
+          if lenInc ≤ dstSize then
+            state.addEvidence (.dynamicBoundsChecked (exprName dst) loc)
+          else
+            state.addViolation
+              (mkBufSinkViolation ctx loc fullExpr fnName
+                s!"{fnName} length {lenInc} exceeds destination buffer size (dst={dstSize})"
+                "Prove len is bounded by the destination buffer size")
+      | none =>
+          state.addViolation
+            (mkBufSinkViolation ctx loc fullExpr fnName
+              s!"Cannot verify {fnName} length against destination buffer (dst={dstSize})"
+              "Prove len is bounded by the destination buffer size")
+  | none => state
+
+private def checkLiteralFitsCall (ctx : VerifyCtx) (fnName : String) (dst src fullExpr : Syntax.Expr)
+    (loc : Syntax.Loc) (state : FlowState) : FlowState :=
+  match src with
+  | .strLit s _ =>
+      match bufferSizeBytes? ctx state dst with
+      | some dstSize =>
+          if s.length + 1 ≤ dstSize then
+            state.addEvidence (.dynamicBoundsChecked (exprName dst) loc)
+          else
+            state.addViolation
+              (mkBufSinkViolation ctx loc fullExpr fnName
+                s!"{fnName} source literal ({s.length + 1} bytes incl. NUL) exceeds destination buffer size (dst={dstSize})"
+                s!"Use a bounded copy (e.g. strncpy/snprintf) or enlarge the destination")
+      | none =>
+          state.addViolation
+            (mkBufSinkViolation ctx loc fullExpr fnName
+              s!"Cannot verify {fnName} destination buffer size"
+              "Prove the destination buffer is large enough for the source")
+  | _ =>
+      state.addViolation
+        (mkBufSinkViolation ctx loc fullExpr fnName
+          s!"Cannot verify {fnName} destination is large enough for a non-literal source"
+          s!"Use a bounded copy (e.g. strncpy/snprintf) or a literal source of known length")
+
+-- ══════════════════════════════════════════════════════════════
+-- Kill/shift range facts on write (FEL-42). Any write to a tracked key must
+-- either recompute its range from the new value or forget it — a stale
+-- upper bound surviving a reassignment is how the Heartbleed-shaped bug in
+-- FEL-42 slips past a bounds check.
+-- ══════════════════════════════════════════════════════════════
+
+/-- If `rhs` is `key + literal` / `literal + key` / `key - literal` where
+    `key` matches `selfKey`, return the signed delta (`i = i + 100` and its
+    `i - k` counterpart; used for both plain reassignment and the desugared
+    shape produced by `i += k`). -/
+private def selfShiftDelta? (ctx : VerifyCtx) (selfKey : String) (rhs : Syntax.Expr) : Option Int :=
+  match rhs with
+  | .binOp .add a b _ =>
+      match boundKeyFromExpr? a, resolveExprInt ctx b with
+      | some k, some d => if k == selfKey then some d else none
+      | _, _ =>
+          match boundKeyFromExpr? b, resolveExprInt ctx a with
+          | some k, some d => if k == selfKey then some d else none
+          | _, _ => none
+  | .binOp .sub a _b _ =>
+      match boundKeyFromExpr? a with
+      | some k =>
+          if k == selfKey then
+            match resolveExprInt ctx _b with
+            | some d => some (-d)
+            | none => none
+          else none
+      | none => none
+  | _ => none
+
+private def applyScalarAssign (ctx : VerifyCtx) (lhs rhs : Syntax.Expr) (state : FlowState)
+    : FlowState :=
+  match boundKeyFromExpr? lhs with
+  | none => state
+  | some key =>
+      match resolveExprInt ctx rhs with
+      | some v => state.setRange key (IRange.point v)
+      | none =>
+          match selfShiftDelta? ctx key rhs with
+          | some d =>
+              match state.getRange key with
+              | some r => state.setRange key (r.shift d)
+              | none => state.clearRange key
+          | none => state.clearRange key
+
+private def applyScalarCompound (ctx : VerifyCtx) (op : Syntax.BinOp) (lhs rhs : Syntax.Expr)
+    (state : FlowState) : FlowState :=
+  match boundKeyFromExpr? lhs with
+  | none => state
+  | some key =>
+      let delta? : Option Int :=
+        match op with
+        | .addAssign => resolveExprInt ctx rhs
+        | .subAssign => (resolveExprInt ctx rhs).map (fun v => -v)
+        | _ => none
+      match delta?, state.getRange key with
+      | some d, some r => state.setRange key (r.shift d)
+      | _, _ => state.clearRange key
+
+private def applyScalarIncDec (op : Syntax.UnOp) (operand : Syntax.Expr) (state : FlowState)
+    : FlowState :=
+  match boundKeyFromExpr? operand with
+  | none => state
+  | some key =>
+      let delta? : Option Int :=
+        match op with
+        | .preInc | .postInc => some 1
+        | .preDec | .postDec => some (-1)
+        | _ => none
+      match delta?, state.getRange key with
+      | some d, some r => state.setRange key (r.shift d)
+      | some _, none => state.clearRange key
+      | none, _ => state
+
+/-- Called for a `varDecl` initializer: seeds a point range when the
+    initializer resolves to a known integer, otherwise leaves it unknown
+    (never clears — the variable has no prior tracked range to go stale). -/
+def applyDeclRange (ctx : VerifyCtx) (name : String) (init : Syntax.Expr) (state : FlowState)
+    : FlowState :=
+  match resolveExprInt ctx init with
+  | some v => state.setRange name (IRange.point v)
+  | none => state
+
+/-- Bounds checks over expressions (array index, memcpy-shaped sinks, and
+    range invalidation/update on writes). -/
 partial def checkExpr (ctx : VerifyCtx) (expr : Syntax.Expr) (state : FlowState) : FlowState :=
   match expr with
   | .intLit _ _ | .charLit _ _ | .var _ _ | .sizeOf _ _ => state
-  | .binOp _ lhs rhs _ =>
-      let s1 := checkExpr ctx lhs state
-      checkExpr ctx rhs s1
-  | .unOp _ operand _ => checkExpr ctx operand state
+  | .binOp op lhs rhs _ =>
+      match op with
+      | .addAssign | .subAssign | .mulAssign | .divAssign | .modAssign
+      | .andAssign | .orAssign | .xorAssign | .shlAssign | .shrAssign =>
+          let s1 := checkExpr ctx lhs state
+          let s2 := checkExpr ctx rhs s1
+          applyScalarCompound ctx op lhs rhs s2
+      | _ =>
+          let s1 := checkExpr ctx lhs state
+          checkExpr ctx rhs s1
+  | .unOp op operand _ =>
+      match op with
+      | .preInc | .preDec | .postInc | .postDec =>
+          let s1 := checkExpr ctx operand state
+          applyScalarIncDec op operand s1
+      | _ => checkExpr ctx operand state
   | .member obj _ _ => checkExpr ctx obj state
   | .arrow ptr _ _ => checkExpr ctx ptr state
   | .index arr idx loc =>
@@ -201,15 +384,29 @@ partial def checkExpr (ctx : VerifyCtx) (expr : Syntax.Expr) (state : FlowState)
       checkIndexAccess ctx arr idx expr loc s2
   | .call fn args loc =>
       let s1 := args.foldl (fun st arg => checkExpr ctx arg st) state
-      if fn == "memcpy" then
-        match args with
-        | [dst, src, len] => checkMemcpyCall ctx dst src len expr loc s1
-        | _ => s1
-      else
-        s1
+      match fn, args with
+      | "memcpy", [dst, src, len] => checkCopyCall ctx "memcpy" dst src len expr loc s1
+      | "memmove", [dst, src, len] => checkCopyCall ctx "memmove" dst src len expr loc s1
+      | "memset", [dst, _val, len] => checkSingleBufLenCall ctx "memset" dst len expr loc s1
+      | "strncpy", [dst, _src, len] => checkSingleBufLenCall ctx "strncpy" dst len expr loc s1
+      | "snprintf", (dst :: len :: _rest) => checkSingleBufLenCall ctx "snprintf" dst len expr loc s1
+      | "strcpy", [dst, src] => checkLiteralFitsCall ctx "strcpy" dst src expr loc s1
+      | "strcat", [dst, src] => checkLiteralFitsCall ctx "strcat" dst src expr loc s1
+      | "sprintf", (_dst :: _rest) =>
+          s1.addViolation
+            (mkBufSinkViolation ctx loc expr "sprintf"
+              "sprintf has no bound on output length"
+              "Use snprintf with an explicit destination size instead")
+      | "gets", [_dst] =>
+          s1.addViolation
+            (mkBufSinkViolation ctx loc expr "gets"
+              "gets() cannot bound input length and is inherently unsafe"
+              "Use fgets with an explicit buffer size instead")
+      | _, _ => s1
   | .assign lhs rhs _ =>
       let s1 := checkExpr ctx lhs state
-      checkExpr ctx rhs s1
+      let s2 := checkExpr ctx rhs s1
+      applyScalarAssign ctx lhs rhs s2
   -- Phase 2 Expr
   | .strLit _ _ | .nullLit _ | .floatLit _ _ => state
   | .ternary c t e _ =>
@@ -224,53 +421,5 @@ partial def checkExpr (ctx : VerifyCtx) (expr : Syntax.Expr) (state : FlowState)
   | .callFnPtr fn args _ =>
       let s1 := checkExpr ctx fn state
       args.foldl (fun st arg => checkExpr ctx arg st) s1
-
-/-- Statement-level bounds check entrypoint. -/
-partial def check (ctx : VerifyCtx) (stmt : Syntax.Stmt) (state : FlowState) : FlowState :=
-  match stmt with
-  | .varDecl _ _ init _ =>
-      match init with
-      | some expr => checkExpr ctx expr state
-      | none => state
-  | .exprStmt expr _ => checkExpr ctx expr state
-  | .ret val _ =>
-      match val with
-      | some expr => checkExpr ctx expr state
-      | none => state
-  | .ifElse cond thenBody elseBody _ =>
-      let s0 := checkExpr ctx cond state
-      let sThen := thenBody.foldl (fun st stx => check ctx stx st) s0
-      let sElse := elseBody.foldl (fun st stx => check ctx stx st) s0
-      FlowState.merge sThen sElse
-  | .while_ cond body _ =>
-      let s0 := checkExpr ctx cond state
-      let bodyState := body.foldl (fun st stx => check ctx stx st) s0
-      FlowState.merge s0 bodyState
-  | .for_ init cond step body _ =>
-      let s1 :=
-        match init with
-        | some initStmt => check ctx initStmt state
-        | none => state
-      let s2 :=
-        match cond with
-        | some condExpr => checkExpr ctx condExpr s1
-        | none => s1
-      let s3 :=
-        match step with
-        | some stepExpr => checkExpr ctx stepExpr s2
-        | none => s2
-      let bodyState := body.foldl (fun st stx => check ctx stx st) s3
-      FlowState.merge s3 bodyState
-  | .block stmts _ => stmts.foldl (fun st stx => check ctx stx st) state
-  -- Phase 2 Stmt
-  | .switch_ scrut cases _ =>
-      let s0 := checkExpr ctx scrut state
-      cases.foldl (fun st (_, body, _) => body.foldl (fun s stx => check ctx stx s) st) s0
-  | .doWhile body cond _ =>
-      let s1 := body.foldl (fun st stx => check ctx stx st) state
-      checkExpr ctx cond s1
-  | .break_ _ | .continue_ _ | .emptyStmt _ => state
-  | .goto_ _ _ => state
-  | .label_ _ body _ => check ctx body state
 
 end CCC.Verify.BoundsCheck

@@ -509,7 +509,20 @@ partial def parseUnary : Parser Expr := do
           pure (.cast castTy operand tok.loc)
       else
         parseAtom
-  | _ => parseAtom
+  -- Base case: no more unary-prefix operators. Postfix (`.`/`->`/`[]`/call/
+  -- `++`/`--`) binds TIGHTER than any unary prefix operator in C, so it must
+  -- be completed here, at the bottom of the prefix-operator recursion,
+  -- before unwinding back through any enclosing `*`/`-`/`!`/`~`/`&`. Without
+  -- this, `*s.p` parsed as `(*s).p` instead of `*(s.p)` — deref-then-member
+  -- instead of member-then-deref — silently corrupting the meaning of any
+  -- `*p->field` / `*p.field` / `*p[i]` expression (this is exactly the
+  -- shape that produced the spurious "dereference of non-pointer variable"
+  -- report on `*s.p` during the 2026-09 review). `parsePrimary`'s own
+  -- trailing `parsePostfix` call becomes a safe no-op once this has already
+  -- consumed the postfix chain.
+  | _ => do
+      let a ← parseAtom
+      parsePostfix a
 
 partial def parseAtom : Parser Expr := do
   let tok : Token ← currentToken

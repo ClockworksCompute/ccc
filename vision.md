@@ -1,0 +1,1 @@
+- Being able to validate and fix vulnerability in existing software, wihout necessarily aving to modify the source

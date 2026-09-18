@@ -1,19 +1,41 @@
 import CCC.Syntax.AST
 import CCC.Syntax.PtrState
+import CCC.Verify.Range
 
 namespace CCC.Verify
 
-/-- Read-only context available during verification. -/
+/-- Read-only context available during verification.
+
+    `funcFreesParam` is a coarse whole-program summary (FEL-48, partial):
+    for each user-defined function name, whether a direct (unconditional or
+    conditional — this scan does not distinguish) call to `free()` on each
+    parameter position appears anywhere in its body. It lets a call site
+    treat `release(p); *p = 1;` as a use-after-free even though `free` was
+    called inside `release`, not directly. This is NOT a full call-graph
+    fixed point (recursive functions and multi-hop aliasing are not
+    modelled) — see FEL-58 for the complete interprocedural design. -/
 structure VerifyCtx where
   structs : List Syntax.StructDef
   currentFun : String
+  funcFreesParam : List (String × List Bool) := []
   deriving Inhabited
+
+namespace VerifyCtx
+
+/-- Does the named function free its `idx`-th parameter (0-based) somewhere
+    in its body, per the coarse whole-program scan? -/
+def freesParamAt (ctx : VerifyCtx) (fn : String) (idx : Nat) : Bool :=
+  match ctx.funcFreesParam.find? (·.1 == fn) with
+  | some (_, flags) => flags.getD idx false
+  | none => false
+
+end VerifyCtx
 
 /-- Per-function flow-sensitive verifier state. -/
 structure FlowState where
   ptrStates  : List (String × Syntax.PtrState)
   varTypes   : List (String × Syntax.CType)
-  bounds     : List (String × Nat)
+  bounds     : List (String × IRange)
   aliases    : List (String × String)   -- (alias, origin) pointer alias pairs
   evidence   : List Syntax.SafetyEvidence
   violations : List Syntax.SafetyViolation
@@ -35,11 +57,39 @@ def getType (state : FlowState) (name : String) : Option Syntax.CType :=
 def setType (state : FlowState) (name : String) (ty : Syntax.CType) : FlowState :=
   { state with varTypes := (name, ty) :: state.varTypes.filter (·.1 != name) }
 
-def getBound (state : FlowState) (name : String) : Option Nat :=
+/-- Get the tracked range for a key (variable name or access-path key like "obj->field"). -/
+def getRange (state : FlowState) (name : String) : Option IRange :=
   (state.bounds.find? (·.1 == name)).map (·.2)
 
-def setBound (state : FlowState) (name : String) (bound : Nat) : FlowState :=
-  { state with bounds := (name, bound) :: state.bounds.filter (·.1 != name) }
+/-- Backwards-compatible alias: the old API name. -/
+def getBound (state : FlowState) (name : String) : Option IRange := state.getRange name
+
+def setRange (state : FlowState) (name : String) (r : IRange) : FlowState :=
+  { state with bounds := (name, r) :: state.bounds.filter (·.1 != name) }
+
+def setBound (state : FlowState) (name : String) (r : IRange) : FlowState := state.setRange name r
+
+/-- Remove all tracked range information for a key (used when a write invalidates
+    facts we cannot precisely re-derive). -/
+def clearRange (state : FlowState) (name : String) : FlowState :=
+  { state with bounds := state.bounds.filter (·.1 != name) }
+
+/-- Remove range information for every key with the given string prefix
+    (used when a struct pointer is reassigned: kill every "obj->..." key). -/
+def clearRangesWithPrefix (state : FlowState) (pfx : String) : FlowState :=
+  { state with bounds := state.bounds.filter (fun kv => !(kv.1.startsWith pfx)) }
+
+/-- Only tighten the upper bound of `name`'s range, leaving the lower bound
+    (if any) untouched. This is what a `i < n` branch fact should do — it must
+    not erase a previously-established `i ≥ 0` fact. -/
+def tightenHiExclusive (state : FlowState) (name : String) (v : Int) : FlowState :=
+  let cur := (state.getRange name).getD IRange.unknown
+  state.setRange name (cur.withHiExclusive v)
+
+/-- Only tighten the lower bound of `name`'s range. -/
+def tightenLo (state : FlowState) (name : String) (v : Int) : FlowState :=
+  let cur := (state.getRange name).getD IRange.unknown
+  state.setRange name (cur.withLo v)
 
 def addViolation (state : FlowState) (v : Syntax.SafetyViolation) : FlowState :=
   { state with violations := state.violations ++ [v] }
@@ -132,11 +182,15 @@ def FlowState.merge (a b : FlowState) : FlowState :=
       []
 
   let boundNames : List String := FlowState.collectAllNames a.bounds b.bounds
-  let mergedBounds : List (String × Nat) :=
+  -- Sound merge: a range is only kept when BOTH branches know one for this
+  -- key. If either branch cleared it (or never had it), the joined value is
+  -- unknown — propagating a single-sided bound here would be unsound (the
+  -- branch that lacks it may have reassigned the variable to anything).
+  let mergedBounds : List (String × IRange) :=
     boundNames.foldl
       (fun acc name =>
-        match a.getBound name, b.getBound name with
-        | some ba, some bb => (name, Nat.min ba bb) :: acc
+        match a.getRange name, b.getRange name with
+        | some ra, some rb => (name, IRange.merge ra rb) :: acc
         | _, _ => acc)
       []
 

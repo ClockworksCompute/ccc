@@ -66,47 +66,4 @@ partial def checkExpr (ctx : VerifyCtx) (expr : Syntax.Expr) (state : FlowState)
       let s1 := checkExpr ctx fn state
       args.foldl (fun st arg => checkExpr ctx arg st) s1
 
-/-- Null-dereference check entrypoint for statements. -/
-partial def check (ctx : VerifyCtx) (stmt : Syntax.Stmt) (state : FlowState) : FlowState :=
-  match stmt with
-  | .varDecl _ _ init _ =>
-      match init with
-      | some expr => checkExpr ctx expr state
-      | none => state
-  | .exprStmt expr _ => checkExpr ctx expr state
-  | .ret val _ =>
-      match val with
-      | some expr => checkExpr ctx expr state
-      | none => state
-  | .ifElse cond thenBody elseBody _ =>
-      let s0 := checkExpr ctx cond state
-      let sThen := thenBody.foldl (fun st stx => check ctx stx st) s0
-      let sElse := elseBody.foldl (fun st stx => check ctx stx st) s0
-      FlowState.merge sThen sElse
-  | .while_ cond body _ =>
-      let s0 := checkExpr ctx cond state
-      body.foldl (fun st stx => check ctx stx st) s0
-  | .for_ init cond step body _ =>
-      let s1 := match init with
-        | some initStmt => check ctx initStmt state
-        | none => state
-      let s2 := match cond with
-        | some condExpr => checkExpr ctx condExpr s1
-        | none => s1
-      let s3 := match step with
-        | some stepExpr => checkExpr ctx stepExpr s2
-        | none => s2
-      body.foldl (fun st stx => check ctx stx st) s3
-  | .block stmts _ => stmts.foldl (fun st stx => check ctx stx st) state
-  -- Phase 2 Stmt
-  | .switch_ scrut cases _ =>
-      let s0 := checkExpr ctx scrut state
-      cases.foldl (fun st (_, body, _) => body.foldl (fun s stx => check ctx stx s) st) s0
-  | .doWhile body cond _ =>
-      let s1 := body.foldl (fun st stx => check ctx stx st) state
-      checkExpr ctx cond s1
-  | .break_ _ | .continue_ _ | .emptyStmt _ => state
-  | .goto_ _ _ => state
-  | .label_ _ body _ => check ctx body state
-
 end CCC.Verify.NullCheck

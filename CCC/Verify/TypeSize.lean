@@ -48,6 +48,30 @@ partial def sizeOfType (ctx : VerifyCtx) (ty : Syntax.CType) : Option Nat :=
   | .volatile_ inner => sizeOfType ctx inner
   | .restrict_ inner => sizeOfType ctx inner
 
+/-- Resolve a compile-time signed-integer expression. Like `resolveExprNat`
+    but keeps the sign, so `-5`, `w - h`, and unary negation resolve
+    correctly instead of collapsing to `none`. Used by the range/bounds
+    analysis to compute literal shift deltas and initial point ranges. -/
+partial def resolveExprInt (ctx : VerifyCtx) (expr : Syntax.Expr) : Option Int :=
+  match expr with
+  | .intLit v _ => some v
+  | .charLit c _ => some (Int.ofNat c.toNat)
+  | .sizeOf ty _ => (sizeOfType ctx ty).map Int.ofNat
+  | .unOp .neg operand _ => (resolveExprInt ctx operand).map (fun v => -v)
+  | .binOp op lhs rhs _ =>
+      match resolveExprInt ctx lhs, resolveExprInt ctx rhs with
+      | some a, some b =>
+          match op with
+          | .add => some (a + b)
+          | .sub => some (a - b)
+          | .mul => some (a * b)
+          | .div => if b = 0 then none else some (a / b)
+          | .mod => if b = 0 then none else some (a % b)
+          | _ => none
+      | _, _ => none
+  | .cast _ operand _ => resolveExprInt ctx operand
+  | _ => none
+
 /-- Resolve a compile-time natural-number expression (for sizes/lengths). -/
 partial def resolveExprNat (ctx : VerifyCtx) (expr : Syntax.Expr) : Option Nat :=
   match expr with

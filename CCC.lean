@@ -6,6 +6,7 @@ import CCC.Error.Report
 import CCC.Parse.Token
 import CCC.Parse.Lex
 import CCC.Parse.Parse
+import CCC.Verify.Range
 import CCC.Verify.FlowState
 import CCC.Verify.TypeSize
 import CCC.Verify.PointerSafety

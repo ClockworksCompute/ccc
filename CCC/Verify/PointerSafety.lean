@@ -2,9 +2,16 @@ import CCC.Verify.TypeSize
 
 namespace CCC.Verify.PointerSafety
 
-private def ptrRootName? (expr : Syntax.Expr) : Option String :=
+/-- Access-path key for a pointer-valued expression: a plain variable, or a
+    struct field reached through `.`/`->` off a plain variable. Using the
+    same key scheme as the bounds-range tracker (FEL-44/FEL-57 groundwork) so
+    a pointer stored in a struct field (`s.p`, `s->p`) is tracked exactly
+    like a local variable instead of silently falling through unchecked. -/
+private def ptrKeyOfExpr? (expr : Syntax.Expr) : Option String :=
   match expr with
   | .var name _ => some name
+  | .arrow (.var obj _) field _ => some (obj ++ "->" ++ field)
+  | .member (.var obj _) field _ => some (obj ++ "." ++ field)
   | _ => none
 
 private def isPointerTy (ty : Syntax.CType) : Bool :=
@@ -12,18 +19,41 @@ private def isPointerTy (ty : Syntax.CType) : Bool :=
   | .pointer _ => true
   | _ => false
 
-private def mallocCallSize? (ctx : VerifyCtx) (expr : Syntax.Expr) : Option Nat :=
-  match expr with
-  | .call "malloc" args _ =>
-      match args with
-      | [sizeExpr] => resolveExprNat ctx sizeExpr
-      | _ => none
-  | _ => none
-
+/-- Is this expression a spelling of the null pointer constant? Mirrors
+    `BranchAnalysis`'s recognizer so `p = NULL;` (which preprocesses to a
+    cast of an int literal) is treated the same as `p = 0;` (FEL-49 #2). -/
 private def isZeroLiteral (expr : Syntax.Expr) : Bool :=
   match expr with
+  | .nullLit _ => true
   | .intLit v _ => v == 0
+  | .cast _ (.intLit v _) _ => v == 0
+  | .cast _ (.nullLit _) _ => true
   | _ => false
+
+/-- Classify a call as a fresh-allocation call (malloc/calloc/strdup/
+    aligned_alloc), returning its known size if resolvable — `none` for the
+    size means "allocated, but we don't know how much" (FEL-47: this must
+    still be tracked as `nullable`, not silently dropped to `uninitialized`
+    the way an unresolvable `malloc(n)` used to be). -/
+private def allocCallInfo? (ctx : VerifyCtx) (expr : Syntax.Expr) : Option (Option Nat) :=
+  match expr with
+  | .call "malloc" [sizeExpr] _ => some (resolveExprNat ctx sizeExpr)
+  | .call "calloc" [nExpr, szExpr] _ =>
+      let sz := match resolveExprNat ctx nExpr, resolveExprNat ctx szExpr with
+        | some n, some s => some (n * s)
+        | _, _ => none
+      some sz
+  | .call "strdup" [_] _ => some none
+  | .call "aligned_alloc" [_alignExpr, sizeExpr] _ => some (resolveExprNat ctx sizeExpr)
+  | _ => none
+
+/-- `realloc(ptr, size)`: the old allocation (and its whole alias group) is
+    freed, and a fresh nullable pointer of the new size is produced. -/
+private def reallocCallInfo? (ctx : VerifyCtx) (expr : Syntax.Expr)
+    : Option (Syntax.Expr × Option Nat) :=
+  match expr with
+  | .call "realloc" [ptrExpr, sizeExpr] _ => some (ptrExpr, resolveExprNat ctx sizeExpr)
+  | _ => none
 
 private def mkUseAfterFreeViolation (ctx : VerifyCtx) (loc : Syntax.Loc) (expr : Syntax.Expr)
     : Syntax.SafetyViolation :=
@@ -51,6 +81,24 @@ private def mkInvalidFreeViolation (ctx : VerifyCtx) (loc : Syntax.Loc) (expr : 
     message := "Attempt to free a pointer that is not known to be heap-live"
     context := [s!"function: {ctx.currentFun}"]
     suggestion := some "Only call free on heap pointers returned from malloc" }
+
+private def mkUnresolvedDerefViolation (ctx : VerifyCtx) (loc : Syntax.Loc) (expr : Syntax.Expr)
+    : Syntax.SafetyViolation :=
+  { property := .noUseAfterFree
+    loc := loc
+    expr := reprStr expr
+    message := "Cannot verify liveness of this pointer expression (not a tracked variable or struct field)"
+    context := [s!"function: {ctx.currentFun}"]
+    suggestion := some "Rewrite via a named pointer variable so CCC can track its lifetime, or add an explicit bounds/liveness check" }
+
+private def mkUninitDerefViolation (ctx : VerifyCtx) (loc : Syntax.Loc) (expr : Syntax.Expr)
+    (name : String) : Syntax.SafetyViolation :=
+  { property := .noNullDeref
+    loc := loc
+    expr := reprStr expr
+    message := s!"Dereference of pointer '{name}' that was never initialized"
+    context := [s!"function: {ctx.currentFun}"]
+    suggestion := some s!"Initialize '{name}' (e.g. via malloc, or address-of a valid object) before dereferencing" }
 
 private partial def tyName : Syntax.CType → String
   | .void => "void"
@@ -88,29 +136,43 @@ private def mkDerefNonPointerViolation (ctx : VerifyCtx) (loc : Syntax.Loc)
     context := [s!"function: {ctx.currentFun}"]
     suggestion := some s!"Variable '{name}' is not a pointer; remove the dereference operator" }
 
+/-- Pointer liveness check for a dereference/index/arrow whose base is
+    `ptrExpr`. `fullExpr`/`loc` identify the overall access for reporting.
+
+    FEL-44: an unresolvable base (pointer arithmetic, a call result, a
+    double dereference, …) used to be silently accepted because there was
+    nothing to look up. That is a soundness hole — we now report it as a
+    "cannot verify" violation instead, and a resolved-but-`uninitialized`
+    pointer (declared but never assigned) is now flagged too. -/
 private def checkDereferenceable (ctx : VerifyCtx) (state : FlowState)
     (ptrExpr : Syntax.Expr) (fullExpr : Syntax.Expr) (loc : Syntax.Loc) : FlowState :=
-  match ptrRootName? ptrExpr with
+  match ptrKeyOfExpr? ptrExpr with
   | some name =>
       match state.getPtr name with
       | some .freed => state.addViolation (mkUseAfterFreeViolation ctx loc fullExpr)
+      | some .uninitialized => state.addViolation (mkUninitDerefViolation ctx loc fullExpr name)
       | some ps =>
           if Syntax.PtrState.isDereferenceable ps then
             state.addEvidence (.ptrLive name ps)
           else
+            -- `.nullable` falls here; NullCheck reports the null-deref for it.
             state
       | none =>
-          -- No pointer state: check if the variable has a known non-pointer type
+          -- No pointer state at all: check if the variable has a known
+          -- non-pointer type (a real bug: `*x` on an `int`), otherwise this
+          -- is a name we simply never modelled (e.g. a global) — leave it
+          -- to whatever narrower check applies rather than over-claiming.
           match state.getType name with
           | some ty =>
               if isPointerTy ty then state
               else state.addViolation (mkDerefNonPointerViolation ctx loc fullExpr name ty)
           | none => state
-  | none => state
+  | none =>
+      state.addViolation (mkUnresolvedDerefViolation ctx loc fullExpr)
 
 private def applyFreeTransition (ctx : VerifyCtx) (state : FlowState)
     (arg : Syntax.Expr) (fullExpr : Syntax.Expr) (loc : Syntax.Loc) : FlowState :=
-  match ptrRootName? arg with
+  match ptrKeyOfExpr? arg with
   | some name =>
       match state.getPtr name with
       | some .freed => state.addViolation (mkDoubleFreeViolation ctx loc fullExpr)
@@ -119,41 +181,60 @@ private def applyFreeTransition (ctx : VerifyCtx) (state : FlowState)
       | some _ =>
           -- Mark the freed name AND all its aliases as freed
           let group := state.getAliasGroup name
-          group.foldl (fun st n => st.setPtr n .freed) state
+          group.foldl (fun (st : FlowState) n => st.setPtr n .freed) state
       | none => state
   | none => state
 
-private def applyAssignTransition (ctx : VerifyCtx) (state : FlowState)
-    (lhs rhs : Syntax.Expr) : FlowState :=
-  match lhs with
-  | .var lhsName _ =>
-      match state.getType lhsName with
-      | some lhsTy =>
-          if isPointerTy lhsTy then
-            match mallocCallSize? ctx rhs with
-            | some n =>
-                -- Fresh allocation: break old aliases, no new alias
-                (state.removeAliasesFor lhsName).setPtr lhsName (.nullable (some n))
-            | none =>
-                match rhs with
-                | .var rhsName _ =>
-                    match state.getPtr rhsName with
-                    | some rhsState =>
-                        -- Pointer-to-pointer copy: break old aliases, register new
-                        let s1 := state.removeAliasesFor lhsName
-                        let s2 := s1.setPtr lhsName rhsState
-                        s2.addAlias lhsName rhsName
-                    | none => state
-                | _ =>
-                    if isZeroLiteral rhs then
-                      (state.removeAliasesFor lhsName).setPtr lhsName (.nullable none)
-                    else state
-          else
-            state
-      | none => state
-  | _ => state
+/-- FEL-48 (partial interprocedural step): if `fn` is known (via the
+    whole-program `funcFreesParam` scan) to call `free()` on one of its
+    parameters, propagate that transition to the matching argument at this
+    call site — so `release(p); *p = 1;` is caught even though the actual
+    `free` call is textually inside `release`, not here. -/
+private def applyCalleeFreeSummaries (ctx : VerifyCtx) (fn : String) (args : List Syntax.Expr)
+    (fullExpr : Syntax.Expr) (loc : Syntax.Loc) (state : FlowState) : FlowState :=
+  let rec go (idx : Nat) (remaining : List Syntax.Expr) (st : FlowState) : FlowState :=
+    match remaining with
+    | [] => st
+    | a :: rest =>
+        let st' := if ctx.freesParamAt fn idx then applyFreeTransition ctx st a fullExpr loc else st
+        go (idx + 1) rest st'
+  go 0 args state
 
-/-- Pointer liveness checks over expressions (use-after-free + free transitions). -/
+/-- Shared transition for "pointer variable/field is (re)assigned to `rhs`":
+    used by both a `varDecl` initializer and a plain `lhs = rhs` assignment.
+    Handles fresh allocation (malloc/calloc/strdup/aligned_alloc), `realloc`
+    (frees the old allocation's alias group first), aliasing a live pointer,
+    and assignment of a null constant (any spelling). -/
+private def transitionPtrWrite (ctx : VerifyCtx) (state : FlowState) (name : String)
+    (rhs : Syntax.Expr) : FlowState :=
+  match allocCallInfo? ctx rhs with
+  | some sizeOpt => (state.removeAliasesFor name).setPtr name (.nullable sizeOpt)
+  | none =>
+      match reallocCallInfo? ctx rhs with
+      | some (origPtr, sizeOpt) =>
+          let s1 :=
+            match ptrKeyOfExpr? origPtr with
+            | some oldName =>
+                let group := state.getAliasGroup oldName
+                group.foldl (fun (st : FlowState) n => st.setPtr n .freed) state
+            | none => state
+          (s1.removeAliasesFor name).setPtr name (.nullable sizeOpt)
+      | none =>
+          match rhs with
+          | .var rhsName _ =>
+              match state.getPtr rhsName with
+              | some rhsState =>
+                  let s1 := state.removeAliasesFor name
+                  let s2 := s1.setPtr name rhsState
+                  s2.addAlias name rhsName
+              | none => state
+          | _ =>
+              if isZeroLiteral rhs then
+                (state.removeAliasesFor name).setPtr name (.nullable none)
+              else state
+
+/-- Pointer liveness checks over expressions (use-after-free + free
+    transitions + allocation/alias tracking on write). -/
 partial def checkExpr (ctx : VerifyCtx) (expr : Syntax.Expr) (state : FlowState) : FlowState :=
   match expr with
   | .intLit _ _ | .charLit _ _ | .var _ _ | .sizeOf _ _ => state
@@ -179,11 +260,27 @@ partial def checkExpr (ctx : VerifyCtx) (expr : Syntax.Expr) (state : FlowState)
         | [arg] => applyFreeTransition ctx s1 arg expr loc
         | _ => s1
       else
-        s1
+        applyCalleeFreeSummaries ctx fn args expr loc s1
   | .assign lhs rhs _loc =>
       let s1 := checkExpr ctx lhs state
       let s2 := checkExpr ctx rhs s1
-      applyAssignTransition ctx s2 lhs rhs
+      match ptrKeyOfExpr? lhs with
+      | some name =>
+          match s2.getType name with
+          | some lhsTy => if isPointerTy lhsTy then transitionPtrWrite ctx s2 name rhs else s2
+          | none =>
+              -- No declared scalar type for this key (typical for a struct
+              -- field like `s.p`, since field types aren't in `varTypes`):
+              -- only treat as a pointer transition when the RHS is itself
+              -- clearly pointer-shaped, so we don't misfire on plain
+              -- integer field assignments like `r->len = 9999`.
+              match allocCallInfo? ctx rhs, reallocCallInfo? ctx rhs, rhs with
+              | some _, _, _ => transitionPtrWrite ctx s2 name rhs
+              | _, some _, _ => transitionPtrWrite ctx s2 name rhs
+              | _, _, .var rhsName _ =>
+                  if (s2.getPtr rhsName).isSome then transitionPtrWrite ctx s2 name rhs else s2
+              | _, _, _ => s2
+      | none => s2
   -- Phase 2 Expr
   | .strLit _ _ | .nullLit _ | .floatLit _ _ => state
   | .ternary c t e _ =>
@@ -216,66 +313,9 @@ def handleVarDecl (ctx : VerifyCtx) (name : String) (ty : Syntax.CType)
       let s1 := checkExpr ctx initExpr typedState
       let s2 : FlowState :=
         match ty with
-        | .pointer _ =>
-            match mallocCallSize? ctx initExpr with
-            | some n => s1.setPtr name (.nullable (some n))
-            | none =>
-                match initExpr with
-                | .var rhsName _ =>
-                    match s1.getPtr rhsName with
-                    | some rhsState =>
-                        -- Declaration with pointer init: register alias
-                        let st := s1.setPtr name rhsState
-                        st.addAlias name rhsName
-                    | none => s1
-                | _ => if isZeroLiteral initExpr then s1.setPtr name (.nullable none) else s1
+        | .pointer _ => transitionPtrWrite ctx s1 name initExpr
         | _ => s1
       s2
   | none => typedState
-
-/-- Statement-level entrypoint for pointer safety checks. -/
-partial def check (ctx : VerifyCtx) (stmt : Syntax.Stmt) (state : FlowState) : FlowState :=
-  match stmt with
-  | .varDecl name ty init _ => handleVarDecl ctx name ty init state
-  | .exprStmt expr _ => checkExpr ctx expr state
-  | .ret val _ =>
-      match val with
-      | some expr => checkExpr ctx expr state
-      | none => state
-  | .ifElse cond thenBody elseBody _ =>
-      let s0 := checkExpr ctx cond state
-      let sThen := thenBody.foldl (fun st stx => check ctx stx st) s0
-      let sElse := elseBody.foldl (fun st stx => check ctx stx st) s0
-      FlowState.merge sThen sElse
-  | .while_ cond body _ =>
-      let s0 := checkExpr ctx cond state
-      let bodyState := body.foldl (fun st stx => check ctx stx st) s0
-      FlowState.merge s0 bodyState
-  | .for_ init cond step body _ =>
-      let s1 :=
-        match init with
-        | some initStmt => check ctx initStmt state
-        | none => state
-      let s2 :=
-        match cond with
-        | some condExpr => checkExpr ctx condExpr s1
-        | none => s1
-      let s3 :=
-        match step with
-        | some stepExpr => checkExpr ctx stepExpr s2
-        | none => s2
-      let bodyState := body.foldl (fun st stx => check ctx stx st) s3
-      FlowState.merge s3 bodyState
-  | .block stmts _ => stmts.foldl (fun st stx => check ctx stx st) state
-  -- Phase 2 Stmt
-  | .switch_ scrut cases _ =>
-      let s0 := checkExpr ctx scrut state
-      cases.foldl (fun st (_, body, _) => body.foldl (fun s stx => check ctx stx s) st) s0
-  | .doWhile body cond _ =>
-      let s1 := body.foldl (fun st stx => check ctx stx st) state
-      checkExpr ctx cond s1
-  | .break_ _ | .continue_ _ | .emptyStmt _ => state
-  | .goto_ _ _ => state
-  | .label_ _ body _ => check ctx body state
 
 end CCC.Verify.PointerSafety

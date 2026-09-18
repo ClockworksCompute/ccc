@@ -111,8 +111,13 @@ def main (args : List String) : IO UInt32 := do
   -- Print report
   IO.println result.report
 
-  -- Force-emit mode: violations no longer abort if assembly was produced.
-  -- Only exit 1 if there is no assembly at all.
+  -- FEL-40: `CCC.compile` never produces assembly for a program with
+  -- violations (parse error, verification failure, or emission error all
+  -- leave `assembly := none`), so this is now a plain, correct gate: no
+  -- assembly means nothing further should happen and `ccc` must exit
+  -- non-zero. (Earlier versions force-emitted despite violations and only
+  -- checked for assembly's mere presence, so a rejected program could still
+  -- exit 0 — see FEL-40.)
   let some asm := result.assembly | return 1
 
   -- If compile-only mode, write assembly directly and exit

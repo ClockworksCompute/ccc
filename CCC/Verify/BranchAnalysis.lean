@@ -2,21 +2,28 @@ import CCC.Verify.FlowState
 
 namespace CCC.Verify
 
-/-- Facts learned from a branch condition. Bounds are exclusive upper bounds. -/
+/-- Facts learned from a branch condition, keyed by an access-path string
+    ("name", "obj->field", "obj.field") — see `rangeKeyOfExpr?`. -/
 inductive BranchFact where
   | ptrNonNull (name : String)
   | ptrIsNull (name : String)
-  | varBounded (name : String) (bound : Nat)
-  | varBoundedField (obj : String) (field : String) (bound : Nat)
+  | rangeLo (key : String) (v : Int)           -- key ≥ v
+  | rangeHiExclusive (key : String) (v : Int)  -- key < v
   deriving Repr, Inhabited, BEq, DecidableEq
 
 private def fieldBoundKey (obj : String) (field : String) : String :=
   obj ++ "->" ++ field
 
-private def intLitToNat? (expr : Syntax.Expr) : Option Nat :=
+/-- Signed integer literal value, if the expression is exactly a literal
+    (including a negated literal, so `-5` produced by the unary-minus parse
+    is also recognised). -/
+private partial def intLitToInt? (expr : Syntax.Expr) : Option Int :=
   match expr with
-  | .intLit v _ =>
-      if v < 0 then none else some v.toNat
+  | .intLit v _ => some v
+  | .unOp .neg inner _ =>
+      match intLitToInt? inner with
+      | some v => some (-v)
+      | none => none
   | _ => none
 
 private def ptrNameFromExpr? (expr : Syntax.Expr) : Option String :=
@@ -24,36 +31,65 @@ private def ptrNameFromExpr? (expr : Syntax.Expr) : Option String :=
   | .var name _ => some name
   | _ => none
 
-private def boundExprFromExpr? (expr : Syntax.Expr) : Option (String × Option String) :=
+/-- Is this expression a spelling of the null pointer constant?
+    Covers `0`, the `NULL` macro after preprocessing (`(void*)0`, parsed as a
+    cast of an int literal), and the dedicated `.nullLit` token. -/
+private def isNullLikeExpr (expr : Syntax.Expr) : Bool :=
   match expr with
-  | .var name _ => some (name, none)
-  | .arrow (.var obj _) field _ => some (obj, some field)
+  | .nullLit _ => true
+  | .intLit v _ => v == 0
+  | .cast _ (.intLit v _) _ => v == 0
+  | .cast _ (.nullLit _) _ => true
+  | _ => false
+
+/-- Extract a range-tracking key from a variable or field expression. -/
+private def rangeKeyOfExpr? (expr : Syntax.Expr) : Option String :=
+  match expr with
+  | .var name _ => some name
+  | .arrow (.var obj _) field _ => some (fieldBoundKey obj field)
+  | .member (.var obj _) field _ => some (obj ++ "." ++ field)
   | _ => none
 
-private def makeBoundFact (obj : String) (fieldOpt : Option String) (bound : Nat) : BranchFact :=
-  match fieldOpt with
-  | some field => .varBoundedField obj field bound
-  | none => .varBounded obj bound
+private def makeLoFact (key : String) (v : Int) : BranchFact := .rangeLo key v
+private def makeHiFact (key : String) (v : Int) : BranchFact := .rangeHiExclusive key v
+
+/-- `cmp` is `lhs op rhs` where `lhs` is a tracked key-expression and `rhs` is
+    a literal. Returns (thenFacts, elseFacts) for that orientation. Handles
+    all four ordering operators, producing BOTH an upper-bound fact on the
+    side where it applies and a lower-bound fact on the other side (the
+    previous implementation only ever produced upper bounds). -/
+private def extractOrderedCmp (op : Syntax.BinOp) (key : String) (n : Int)
+    : (List BranchFact) × (List BranchFact) :=
+  match op with
+  | .lt => ([makeHiFact key n],       [makeLoFact key n])       -- i<n / i≥n
+  | .gt => ([makeLoFact key (n + 1)], [makeHiFact key (n + 1)]) -- i>n / i≤n
+  | .le => ([makeHiFact key (n + 1)], [makeLoFact key (n + 1)]) -- i≤n / i>n
+  | .ge => ([makeLoFact key n],       [makeHiFact key n])       -- i≥n / i<n
+  | _ => ([], [])
+
+/-- Flip an ordering operator for swapped operands: `n < i` becomes `i > n`. -/
+private def flipOrder (op : Syntax.BinOp) : Syntax.BinOp :=
+  match op with
+  | .lt => .gt
+  | .gt => .lt
+  | .le => .ge
+  | .ge => .le
+  | other => other
 
 private def extractCmpFacts (op : Syntax.BinOp) (lhs rhs : Syntax.Expr)
     : (List BranchFact) × (List BranchFact) :=
-  match boundExprFromExpr? lhs, intLitToNat? rhs with
-  | some (obj, fieldOpt), some n =>
-      match op with
-      | .lt => ([makeBoundFact obj fieldOpt n], [])
-      | .gt => ([], [makeBoundFact obj fieldOpt (n + 1)])
-      | .le => ([makeBoundFact obj fieldOpt (n + 1)], [])
-      | .ge => ([], [makeBoundFact obj fieldOpt n])
-      | _ => ([], [])
-  | _, _ => ([], [])
+  match rangeKeyOfExpr? lhs, intLitToInt? rhs with
+  | some key, some n => extractOrderedCmp op key n
+  | _, _ =>
+      match intLitToInt? lhs, rangeKeyOfExpr? rhs with
+      | some n, some key => extractOrderedCmp (flipOrder op) key n
+      | _, _ => ([], [])
 
 private def extractNullEqFacts (lhs rhs : Syntax.Expr)
     : (List BranchFact) × (List BranchFact) :=
   let lhsPtr : Option String := ptrNameFromExpr? lhs
   let rhsPtr : Option String := ptrNameFromExpr? rhs
-  let lhsZero : Bool := match rhs with | .intLit v _ => v == 0 | _ => false
-  let rhsZero : Bool := match lhs with | .intLit v _ => v == 0 | _ => false
-  match lhsPtr, rhsPtr, lhsZero, rhsZero with
+  match lhsPtr, rhsPtr, isNullLikeExpr rhs, isNullLikeExpr lhs with
   | some p, _, true, _ => ([.ptrIsNull p], [.ptrNonNull p])
   | _, some p, _, true => ([.ptrIsNull p], [.ptrNonNull p])
   | _, _, _, _ => ([], [])
@@ -62,9 +98,7 @@ private def extractNullNeFacts (lhs rhs : Syntax.Expr)
     : (List BranchFact) × (List BranchFact) :=
   let lhsPtr : Option String := ptrNameFromExpr? lhs
   let rhsPtr : Option String := ptrNameFromExpr? rhs
-  let lhsZero : Bool := match rhs with | .intLit v _ => v == 0 | _ => false
-  let rhsZero : Bool := match lhs with | .intLit v _ => v == 0 | _ => false
-  match lhsPtr, rhsPtr, lhsZero, rhsZero with
+  match lhsPtr, rhsPtr, isNullLikeExpr rhs, isNullLikeExpr lhs with
   | some p, _, true, _ => ([.ptrNonNull p], [.ptrIsNull p])
   | _, some p, _, true => ([.ptrNonNull p], [.ptrIsNull p])
   | _, _, _, _ => ([], [])
@@ -89,6 +123,10 @@ partial def extractFacts (cond : Syntax.Expr) : (List BranchFact) × (List Branc
       let (thenL, _elseL) := extractFacts lhs
       let (thenR, _elseR) := extractFacts rhs
       (thenL ++ thenR, [])
+  -- A bare pointer used as a condition: `if (p)` / `if (!p)` (via the .not_
+  -- case above). Harmless no-op for non-pointer variables (applyFacts only
+  -- acts on tracked pointer state).
+  | .var name _ => ([.ptrNonNull name], [.ptrIsNull name])
   | _ => ([], [])
 
 /-- Apply branch facts to flow state. -/
@@ -105,8 +143,8 @@ def applyFacts (facts : List BranchFact) (state : FlowState) : FlowState :=
           match st.getPtr name with
           | some ps => st.setPtr name (.nullable (Syntax.PtrState.knownSize ps))
           | none => st
-      | .varBounded name bound => st.setBound name bound
-      | .varBoundedField obj field bound => st.setBound (fieldBoundKey obj field) bound)
+      | .rangeLo key v => st.tightenLo key v
+      | .rangeHiExclusive key v => st.tightenHiExclusive key v)
     state
 
 /-- Utility for callers that key bounds by `obj->field`. -/
