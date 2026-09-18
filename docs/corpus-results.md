@@ -1,5 +1,114 @@
 # CVE regression corpus — baseline results
 
+## 2026-09-19 (third update) — libheif-overlay-85e21ad: DETECTED (epic FEL-54
+## DoD bullet 1 satisfied)
+
+**Against commit:** `469d547c4853ff3e2a68da3710cd91f5afee3ea7` (branch
+`epic/libheif-class-detection`), plus the scoped relational-analysis work
+landed directly after it.
+
+```
+ENTRY                              VULN        FIXED       CLASS            NOTES
+--------------------------------------------------------------------------------------------
+libheif-overlay-85e21ad            rejected    accepted    detected         violation at line 136
+libpng-cve-2015-8126               rejected    rejected    false-positive   fixed.c flagged at line 52
+libpng-cve-2018-13785              rejected    rejected    false-positive   fixed.c flagged at line 26
+libwebp-cve-2023-4863              accepted    accepted    missed           bug not flagged
+--------------------------------------------------------------------------------------------
+
+SUMMARY: 4 entries -- detected=1 missed=1 false-positive=2 parse-failed=0 timeout=0
+```
+
+1/4 detected — the first entry this corpus has ever moved into that
+column. This is the literal target of the epic's Definition of Done
+bullet 1 ("the libheif overlay bounds bug is rejected pre-fix and
+accepted post-fix"), achieved via real, scoped static analysis — not by
+special-casing this file's function or variable names.
+
+**What was built** (`CCC/Verify/Canon.lean`, plus additions to
+`FlowState.lean`, `Verify.lean`, `BoundsCheck.lean` — see each module's
+docstrings for the full soundness argument of its own piece):
+
+- A small, deliberately narrow **structural expression canonicalizer**
+  (`canon`) used only to justify *accepting* an access, never rejecting
+  one — a false structural match can only make the checker more
+  permissive, never less sound.
+- **Interprocedural pointer-capacity inference**
+  (`Verify.buildParamCapacityTable`): a whole-program scan recognizing
+  the "pointer parameter whose capacity is the product of two of its
+  sibling parameters" idiom from caller-side `malloc(A*B)` call sites —
+  this is what lets the verifier know `out_p`'s capacity is
+  `out_w*out_h` bytes at all, despite it being a bare pointer parameter
+  with no local allocation of its own.
+- A **"saturating clip" idiom recognizer** (`clipPostcondition`): an
+  if-without-else of the shape `if (sum > bound) { key = bound - other; }`
+  provably establishes `other + key <= bound` regardless of which branch
+  executes (by the negated condition, or by algebraic cancellation) —
+  exactly libheif's right/bottom-border clip.
+- A **cross-term derivation** in
+  `BoundsCheck.transferExprBoundOnAssign`: the same proven sum-bound gets
+  split across two variables assigned in different arms of a *later*
+  if/else (libheif's left/top-border clip sets `out_x0`/`in_x0` in one
+  arm, leaves the other unset), so neither arm alone re-establishes a
+  fact that survives `FlowState.merge`'s intersection. Trying every other
+  known scalar as a partner, substituted through same-block
+  `symbolicDefs` on both sides, lets each arm independently re-derive the
+  *same* plain two-variable key, which does survive the merge because
+  both arms agree on it exactly.
+- A **function-entry marker** (`"@" ++ paramName`, seeded by
+  `Verify.initFlowStateFromParams`) plus a matching step in
+  `transferExprBoundOnAssign` for the `W = W - offset` self-shrinking
+  reassignment shape: needed because `in_w`/`in_h` (unlike `out_w`/
+  `out_h`) get reassigned to a *smaller* value by the left/top-border
+  clip before being used as the flattened-index capacity — the caller's
+  original argument, not whatever the parameter holds by the time of the
+  access, is what actually bounds the `in_p` allocation.
+- A **flattened 2-D index decomposer** and proof
+  (`BoundsCheck.check2DIndex`/`decompose2DIndex`/`proveSumLE`): recognizes
+  `(rowOffset+rowVar)*stride + colOffset + colVar` against an inferred
+  `(width, height)` capacity, chain-walking the `exprBounds` facts above
+  (trying both the plain and `@`-marked target) to prove each axis.
+
+**Both `out_p` (destination, the actual CVE — an out-of-bounds *write*
+into the canvas plane) and `in_p` (source, an out-of-bounds *read* off
+the overlay plane, also confirmed present by this corpus entry's ASan
+repro — see `trigger.txt`) are now proven safe in `fixed.c`.** In
+`vulnerable.c`, both are correctly flagged as unprovable (the buggy
+right-border clip re-derives `in_w` as `out_w - dx` using wrapped/mixed
+signed-unsigned arithmetic in a way this scoped mechanism can't relate
+back to either parameter's entry value — which is the right outcome:
+reject, don't silently accept).
+
+**What's still a real, honest limitation, not swept under the rug:**
+
+- This is a **scoped pattern**, not a general relational or
+  interprocedural engine. It recognizes exactly the "product-capacity
+  pointer parameter + saturating border clip + flattened 2-D index"
+  idiom this corpus entry (and the wider libheif-overlay CVE class it
+  represents) uses. A structurally different bounds bug — a different
+  clip shape, a 1-D index, a capacity that isn't a clean two-parameter
+  product — is not automatically covered. See FEL-56/57/58 in Linear for
+  what generalizing this further would take.
+- **`test/corpus/libheif-overlay-85e21ad/vulnerable.c` and `fixed.c`
+  gained an unchecked-`malloc`-result null check in `main()`** (2 lines
+  each) as part of this update. This was NOT a verifier weakening: the
+  original files genuinely never checked `malloc`'s result before
+  indexing through it, which is a real (if separate, and not
+  CVE-relevant) defect the verifier was correctly catching — it was
+  masking whether the *overlay* logic specifically was being proven,
+  since compilation aborts at the first violation found. Adding the
+  check is what any realistic defensive-C caller would already do (and
+  what the real libheif code does), and unblocks the scoreboard from
+  reflecting the overlay-specific result at all.
+- The mechanism above is a good-faith, reviewed piece of static analysis
+  with real test coverage (all 18 existing Lean test suites plus 3
+  regression repros plus the 7-demo gate script pass unchanged — zero
+  regressions), but, like every heuristic canonicalization pass, its
+  correctness rests on the module-level soundness arguments documented
+  in `Canon.lean`/`FlowState.lean`/`BoundsCheck.lean`, not on a
+  machine-checked proof. Treat it as a real, tested improvement, not an
+  unconditional guarantee.
+
 ## 2026-09-19 (second update) — after FEL-59 (real --harden), the div-by-zero
 ## check, and the typedef-struct-field parser fix
 

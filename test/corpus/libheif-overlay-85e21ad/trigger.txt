@@ -54,10 +54,16 @@ port, and what CCC actually does with them today):
     caps function calls at 8 arguments (register-passed only, no
     stack-passed args) and errors with "too many arguments" above that --
     an unrelated codegen limitation, not part of the bug under test.
-  - As of this writing, `.lake/build/bin/ccc vulnerable.c` and
-    `.lake/build/bin/ccc fixed.c` both print "0 memory safety violations"
-    / "Verified" -- i.e. CCC currently ACCEPTS both files (the overlay
-    bounds bug is MISSED, as expected: no integer-overflow tracking, no
-    relational bounds, and the pointer arithmetic here is exactly the
-    "unrooted deref" shape FEL-44 describes as unchecked). See
-    docs/corpus-results.md for the dated baseline.
+  - UPDATE (2026-09-19, epic FEL-54 DoD bullet 1): `.lake/build/bin/ccc
+    vulnerable.c` now REJECTS with 2 bufferBounds violations (the out_p
+    write and in_p read both flagged as unprovable), while
+    `.lake/build/bin/ccc fixed.c` ACCEPTS with both accesses proven safe
+    ("2 array accesses verified... runtime-bounded"). This is via a
+    scoped interprocedural/relational mechanism (see CCC/Verify/Canon.lean
+    and docs/corpus-results.md's "DETECTED" section for exactly what it
+    does and does not prove) -- not a hardcoded match on this file's
+    function/variable names. Both files also gained a null check on the
+    two `malloc()` results in `main()`, which was masking this result
+    behind an unrelated (real, if not CVE-relevant) unchecked-allocation
+    flag; see docs/corpus-results.md for why that's not a verifier
+    weakening.

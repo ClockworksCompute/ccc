@@ -1,5 +1,6 @@
 import CCC.Verify.BranchAnalysis
 import CCC.Verify.TypeSize
+import CCC.Verify.Canon
 
 namespace CCC.Verify.BoundsCheck
 
@@ -206,10 +207,97 @@ private def bufferSizeBytes? (ctx : VerifyCtx) (state : FlowState)
       | some ty => sizeOfType ctx ty
       | none => none
 
+/-- Decompose `idx` as `(rowOffset+rowVar)*strideExpr + colOffset + colVar`
+    — the flattened-2-D-array-write shape (e.g. libheif's
+    `(out_y0+row)*out_w + out_x0 + col`). Anything else: `none`. -/
+private def decompose2DIndex (idx : Syntax.Expr)
+    : Option (Syntax.Expr × Syntax.Expr × Syntax.Expr × Syntax.Expr × Syntax.Expr) :=
+  match idx with
+  | .binOp .add (.binOp .add (.binOp .mul rowSum strideExpr _) colOffset _) colVar _ =>
+      match rowSum with
+      | .binOp .add rowOffset rowVar _ => some (rowOffset, rowVar, strideExpr, colOffset, colVar)
+      | _ => none
+  | _ => none
+
+/-- Chain-walk proof that `aExpr + xExpr <= targetBound` (all as plain,
+    unsubstituted canon keys — by the time this runs we're always past a
+    branch merge, where `symbolicDefs` has been reset to `[]`, so there is
+    nothing left to substitute through). Tries the direct combined key
+    first, then follows `xExpr`'s own key through its exprBound chain
+    (e.g. `col -> in_w -> out_w`), recombining with `aExpr` at each step.
+    The two-variable combined keys this looks for are exactly the ones
+    `transferExprBoundOnAssign`'s cross-term step establishes below. -/
+private partial def proveSumLE (ctx : VerifyCtx) (state : FlowState)
+    (aExpr xExpr : Syntax.Expr) (targetBound : String) (fuel : Nat) : Bool :=
+  let aC := canon ctx.program aExpr
+  let rec go (curXC : String) (fuel : Nat) : Bool :=
+    let combined := joinAdd aC curXC
+    if state.getExprBound combined == some targetBound then true
+    else if fuel == 0 then false
+    else
+      match state.getExprBound curXC with
+      | some nextC => go nextC (fuel - 1)
+      | none => false
+  go (canon ctx.program xExpr) fuel
+
+/-- FEL-54/56/57/58 (libheif-class detection, epic DoD bullet 1): when the
+    ordinary capacity check above can't even resolve a capacity for `arr`
+    (a bare pointer parameter, not an array with a known static size), try
+    the one additional pattern this epic targets: `arr` is a parameter
+    whose (width, height) capacity was inferred interprocedurally
+    (`VerifyCtx.capacityParamsAt`, from `Verify.buildParamCapacityTable`'s
+    whole-program malloc-call-site scan), and `idx` is a flattened 2-D
+    index whose stride matches the inferred width. If both the row and
+    column offsets can be proven (`proveSumLE`) to stay under their
+    respective bound, the access is accepted; if the pattern matches this
+    far but a bound can't be proven, that's a real violation (the sound
+    default for a recognized-but-unproven 2-D access) rather than silence.
+    Scoped deliberately narrowly (stride must match the inferred width
+    exactly) so this can't become a new false-positive source for
+    ordinary pointer indexing that doesn't match this idiom at all. -/
+private def check2DIndex (ctx : VerifyCtx) (arr idx fullExpr : Syntax.Expr) (loc : Syntax.Loc)
+    (state : FlowState) : Option FlowState :=
+  match arr with
+  | .var arrName _ =>
+      match ctx.currentParamIndex.find? (·.1 == arrName) with
+      | none => none
+      | some (_, arrIdx) =>
+          match ctx.capacityParamsAt ctx.currentFun arrIdx with
+          | none => none
+          | some (widthKey, heightKey) =>
+              match decompose2DIndex idx with
+              | none => none
+              | some (rowOffset, rowVar, strideExpr, colOffset, colVar) =>
+                  if canon ctx.program strideExpr != widthKey then none
+                  else
+                    -- Try both the plain capacity-parameter key AND its
+                    -- function-entry marker (`Verify.initFlowStateFromParams`):
+                    -- a parameter that's never reassigned (like libheif's
+                    -- out_w/out_h) is proven via the plain key; one that IS
+                    -- reassigned before this access (like in_w/in_h, shrunk
+                    -- by the border clip) needs the entry marker, since the
+                    -- CALLER's original argument — not whatever the
+                    -- parameter holds by now — is what actually bounds the
+                    -- allocation.
+                    let colOk := proveSumLE ctx state colOffset colVar widthKey 4 ||
+                                 proveSumLE ctx state colOffset colVar ("@" ++ widthKey) 4
+                    let rowOk := proveSumLE ctx state rowOffset rowVar heightKey 4 ||
+                                 proveSumLE ctx state rowOffset rowVar ("@" ++ heightKey) 4
+                    if colOk && rowOk then
+                      some (state.addEvidence (.dynamicBoundsChecked (exprName arr) loc))
+                    else
+                      some (state.addViolation
+                        (mkBoundsViolation ctx loc fullExpr
+                          s!"Cannot verify flattened 2-D index stays within the inferred capacity ({widthKey}×{heightKey}) of parameter '{arrName}'"))
+  | _ => none
+
 private def checkIndexAccess (ctx : VerifyCtx) (arr idx fullExpr : Syntax.Expr)
     (loc : Syntax.Loc) (state : FlowState) : FlowState :=
   match arrayCapacityElems? ctx state arr with
-  | none => state
+  | none =>
+      match check2DIndex ctx arr idx fullExpr loc state with
+      | some state' => state'
+      | none => state
   | some cap =>
       let r := idxKnownRange ctx state idx
       if !(idxLoOk ctx state idx r) then
@@ -338,8 +426,110 @@ private def selfShiftDelta? (ctx : VerifyCtx) (selfKey : String) (rhs : Syntax.E
       | none => none
   | _ => none
 
+/-- Does `e` mention `key` as a `.var` anywhere in its structure? Used to
+    avoid recording a self-referential symbolic definition (`in_w = in_w -
+    in_x0`): substituting such a definition back into itself during a
+    later `canon` walk doesn't eliminate the variable, it just unrolls it
+    once per unit of `fuel` — actively counterproductive noise, not a
+    useful fact, so these are simply never recorded as a symbolicDef. -/
+private partial def exprMentions (key : String) (e : Syntax.Expr) : Bool :=
+  match e with
+  | .var name _ => name == key
+  | .unOp _ o _ => exprMentions key o
+  | .binOp _ l r _ => exprMentions key l || exprMentions key r
+  | .cast _ o _ => exprMentions key o
+  | .call _ args _ => args.any (exprMentions key)
+  | .callFnPtr f args _ => exprMentions key f || args.any (exprMentions key)
+  | .member o _ _ => exprMentions key o
+  | .arrow p _ _ => exprMentions key p
+  | .index a i _ => exprMentions key a || exprMentions key i
+  | .assign l r _ => exprMentions key l || exprMentions key r
+  | .ternary c t e2 _ => exprMentions key c || exprMentions key t || exprMentions key e2
+  | .comma l r _ => exprMentions key l || exprMentions key r
+  | .initList es _ => es.any (exprMentions key)
+  | _ => false
+
+/-- Every currently-known scalar name worth trying as a cross-term partner
+    for the just-assigned variable, in the derivation below: the current
+    function's own parameters, plus every key with an existing symbolic
+    definition (covers the common case where the "other" side of the sum
+    is a same-block local — like libheif's `out_x0` — that has no
+    parameter status of its own but DOES have a just-recorded
+    definition). -/
+private def crossTermCandidates (ctx : VerifyCtx) (state : FlowState) : List String :=
+  ctx.currentParamIndex.map (·.1) ++ state.symbolicDefs.map (·.1)
+
+/-- FEL-56/57/58 (scoped symbolic bounds): if the RHS's canonical form
+    (substituted through `symbolicDefs`) matches an EXISTING exprBounds
+    fact's key exactly, the assigned variable inherits that fact directly
+    (this is what lets `in_w = in_w - in_x0` — canonicalizing, via the
+    sub-of-negation rule in Canon.lean plus substituting in_x0's own
+    definition, to the SAME string as an earlier `dx + in_w <= out_w`
+    fact — carry the bound forward onto the new `in_w`). Otherwise any
+    exprBound mentioning the assigned key is dropped (sound default).
+
+    The cross-term step handles the companion half of the libheif-overlay
+    idiom: the SAME proven sum-bound gets split across TWO variables
+    assigned in different arms of a LATER if/else (`out_x0`/`in_w` on the
+    `dx<0` arm, only `out_x0` on the other, `in_w` left untouched) — so
+    neither arm alone re-establishes a single-variable fact that survives
+    `FlowState.merge`'s intersection. Trying every other known scalar `Y`
+    as a partner for the just-assigned `X`, substituting through
+    `symbolicDefs` on BOTH sides, lets each arm independently re-derive
+    the SAME plain (unsubstituted) two-variable key — which DOES survive
+    the merge, because both arms agree on it exactly. This can only add a
+    fact when an existing one's canonical form is matched byte-for-byte;
+    it never fabricates a bound that wasn't already proven. -/
+private def transferExprBoundOnAssign (ctx : VerifyCtx) (lhs rhs : Syntax.Expr) (state : FlowState)
+    : FlowState :=
+  let defs := state.symbolicDefs
+  let lhsC := canon ctx.program lhs
+  let rhsC := canon ctx.program rhs defs
+  let state1 :=
+    match state.getExprBound rhsC with
+    | some boundC => (state.clearExprBoundsMentioning lhsC).setExprBound lhsC boundC
+    | none => state.clearExprBoundsMentioning lhsC
+  let state2 :=
+    match boundKeyFromExpr? lhs with
+    | none => state1
+    | some xKey =>
+        (crossTermCandidates ctx state).foldl
+          (fun st yName =>
+            if yName == xKey then st
+            else
+              let yExpr := Syntax.Expr.var yName { line := 0, col := 0 }
+              let yC := canon ctx.program yExpr defs
+              match state.getExprBound (joinAdd rhsC yC) with
+              | some boundC => st.setExprBound (joinAdd lhsC (canon ctx.program yExpr)) boundC
+              | none => st)
+          state1
+  match boundKeyFromExpr? lhs with
+  | none => state2
+  | some key =>
+      if !(exprMentions key rhs) then state2.setSymbolicDef key rhs
+      else
+        -- Self-referential (`W = W - offset`, libheif's border-clip
+        -- shape): never useful as a symbolicDef (see `exprMentions`'s
+        -- docstring), but exactly the shape that lets whatever bound W
+        -- already carried (its function-entry marker, or a narrower one
+        -- from an earlier clip — see `Verify.initFlowStateFromParams`
+        -- and `Verify.clipPostcondition`) survive the reassignment: `W`
+        -- can only SHRINK here, so `W_new + offset = W_old <= priorBound`
+        -- is exactly as sound as the `W_old` fact it's built from.
+        match rhs, state.getExprBound key with
+        | .binOp .sub (.var key' _) offset _, some priorBound =>
+            if key' == key then
+              -- Plain (unsubstituted) offset key, deliberately: this fact
+              -- is looked up again post-merge (once `symbolicDefs` has
+              -- been reset), from `BoundsCheck.check2DIndex`, using the
+              -- SAME plain access-path key the offset variable has there.
+              state2.setExprBound (joinAdd lhsC (canon ctx.program offset)) priorBound
+            else state2
+        | _, _ => state2
+
 private def applyScalarAssign (ctx : VerifyCtx) (lhs rhs : Syntax.Expr) (state : FlowState)
     : FlowState :=
+  let state := transferExprBoundOnAssign ctx lhs rhs state
   match boundKeyFromExpr? lhs with
   | none => state
   | some key =>

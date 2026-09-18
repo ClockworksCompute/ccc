@@ -18,6 +18,27 @@ structure VerifyCtx where
   structs : List Syntax.StructDef
   currentFun : String
   funcFreesParam : List (String × List Bool) := []
+  -- FEL-56/57/58 (libheif-class detection, scoped): the whole program, so
+  -- the symbolic-bounds mechanism (CCC/Verify/Canon.lean) can resolve
+  -- negation-wrapper function calls, and a coarse whole-program
+  -- "pointer parameter capacity = product of two other parameters"
+  -- inference (see `paramCapacity` below) can look up a callee's own
+  -- parameter names.
+  program : Syntax.Program := { structs := [], unions := [], enums := [], typedefs := [],
+                                 globals := [], externs := [], functions := [] }
+  -- For (fn, pointerParamIdx): the callee's OWN parameter names (by
+  -- position) whose product is that pointer parameter's byte capacity,
+  -- inferred from every call site consistently passing an argument there
+  -- whose tracked allocation size is exactly that product (see
+  -- `Verify.buildParamCapacityTable`). Scoped to this one "(ptr, width,
+  -- height)" parameter-group idiom — NOT a general interprocedural
+  -- summary system (that's the rest of FEL-58).
+  paramCapacity : List (String × List (Nat × (String × String))) := []
+  -- Name -> 0-based parameter index, for the CURRENT function only (set
+  -- once per `verifyFunction` call) — lets a checker ask "is this
+  -- variable one of my OWN parameters, and if so which one" without
+  -- needing the full `FunDef` threaded everywhere.
+  currentParamIndex : List (String × Nat) := []
   deriving Inhabited
 
 namespace VerifyCtx
@@ -28,6 +49,13 @@ def freesParamAt (ctx : VerifyCtx) (fn : String) (idx : Nat) : Bool :=
   match ctx.funcFreesParam.find? (·.1 == fn) with
   | some (_, flags) => flags.getD idx false
   | none => false
+
+/-- The inferred (widthParamName, heightParamName) for a pointer parameter
+    at `idx` of the CURRENT function, if the whole-program scan found one. -/
+def capacityParamsAt (ctx : VerifyCtx) (fn : String) (idx : Nat) : Option (String × String) :=
+  match ctx.paramCapacity.find? (·.1 == fn) with
+  | some (_, entries) => (entries.find? (·.1 == idx)).map (·.2)
+  | none => none
 
 end VerifyCtx
 
@@ -46,13 +74,29 @@ structure FlowState where
   -- pointers (unlike `ptrStates`/`ptrNonNull`, which only track pointer
   -- liveness).
   nonZeroKeys : List String
+  -- FEL-56/57/58 (scoped symbolic bounds): canon-string facts "lhs <= rhs"
+  -- (both sides are `CCC.Verify.canon` output, so e.g. a plain variable's
+  -- key is just its name, and a sum's key is the canonicalized sum). See
+  -- Canon.lean's docstring for exactly what canon-equality does and does
+  -- not prove; consulted by BoundsCheck's symbolic 2-D index check and
+  -- kept sound by the same kill-on-write discipline as `bounds`/
+  -- `nonZeroKeys` (cleared on any write not recognized as preserving it).
+  exprBounds : List (String × String)
+  -- Last-assigned expression per key, consulted (bounded, via
+  -- `CCC.Verify.canon`'s `fuel` parameter) to canonicalize an expression
+  -- "as if" a variable's definition were inlined — see Canon.lean's
+  -- docstring. NOT merged across branches (kept empty after any
+  -- `FlowState.merge`): only meaningful within the single straight-line
+  -- sequence where it was established, which is all the one scoped use
+  -- site (BoundsCheck's `transferExprBoundOnAssign`) needs.
+  symbolicDefs : List (String × Syntax.Expr)
   evidence   : List Syntax.SafetyEvidence
   violations : List Syntax.SafetyViolation
   deriving Inhabited
 
 namespace FlowState
 
-def empty : FlowState := ⟨[], [], [], [], [], [], []⟩
+def empty : FlowState := ⟨[], [], [], [], [], [], [], [], []⟩
 
 def getPtr (state : FlowState) (name : String) : Option Syntax.PtrState :=
   (state.ptrStates.find? (·.1 == name)).map (·.2)
@@ -109,6 +153,30 @@ def setNonZero (state : FlowState) (key : String) : FlowState :=
 
 def clearNonZero (state : FlowState) (key : String) : FlowState :=
   { state with nonZeroKeys := state.nonZeroKeys.filter (· != key) }
+
+def getExprBound (state : FlowState) (canonKey : String) : Option String :=
+  (state.exprBounds.find? (·.1 == canonKey)).map (·.2)
+
+def setExprBound (state : FlowState) (canonKey boundCanon : String) : FlowState :=
+  { state with exprBounds := (canonKey, boundCanon) :: state.exprBounds.filter (·.1 != canonKey) }
+
+def clearExprBound (state : FlowState) (canonKey : String) : FlowState :=
+  { state with exprBounds := state.exprBounds.filter (·.1 != canonKey) }
+
+/-- Clear every exprBound fact whose canonical key or bound MENTIONS
+    `name` as a substring token (over-approximate but sound: this can only
+    drop facts, never fabricate one, and dropping a fact can only make a
+    later check more conservative). Used when a variable's write can't be
+    shown to preserve any fact that names it (see BoundsCheck's
+    canon-based transfer, which handles the one case that DOES preserve
+    facts: a write whose canon exactly matches an existing fact's key). -/
+def clearExprBoundsMentioning (state : FlowState) (name : String) : FlowState :=
+  let keep := fun (kv : String × String) =>
+    (kv.1.splitOn name).length == 1 && (kv.2.splitOn name).length == 1
+  { state with exprBounds := state.exprBounds.filter keep }
+
+def setSymbolicDef (state : FlowState) (key : String) (def_ : Syntax.Expr) : FlowState :=
+  { state with symbolicDefs := (key, def_) :: state.symbolicDefs.filter (·.1 != key) }
 
 def addViolation (state : FlowState) (v : Syntax.SafetyViolation) : FlowState :=
   { state with violations := state.violations ++ [v] }
@@ -226,11 +294,18 @@ def FlowState.merge (a b : FlowState) : FlowState :=
   let mergedNonZero : List String :=
     a.nonZeroKeys.filter (fun k => b.isNonZero k)
 
+  -- Same for exprBounds: keep a fact only when both branches agree on the
+  -- exact same bound for the exact same key.
+  let mergedExprBounds : List (String × String) :=
+    a.exprBounds.filter (fun kv => b.getExprBound kv.1 == some kv.2)
+
   { ptrStates := mergedPtrs
     varTypes := mergedTypes
     bounds := mergedBounds
     aliases := mergedAliases
     nonZeroKeys := mergedNonZero
+    exprBounds := mergedExprBounds
+    symbolicDefs := []
     evidence := a.evidence ++ b.evidence
     violations := a.violations ++ b.violations }
 

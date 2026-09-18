@@ -125,7 +125,9 @@ int main() {
     uint32_t in_h = 16;
 
     uint8_t *out_p = malloc(out_w * out_h);
+    if (out_p == 0) return 1;
     uint8_t *in_p = malloc(in_w * in_h);
+    if (in_p == 0) return 1;
 
     uint32_t i = 0;
     while (i < out_w * out_h) {

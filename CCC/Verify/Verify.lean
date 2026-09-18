@@ -3,6 +3,7 @@ import CCC.Verify.PointerSafety
 import CCC.Verify.NullCheck
 import CCC.Verify.BranchAnalysis
 import CCC.Verify.SymbolCheck
+import CCC.Verify.Canon
 
 namespace CCC.Verify
 
@@ -90,7 +91,19 @@ private def initialRangeForParam (ty : Syntax.CType) : Option IRange :=
   | .sizeT => some (IRange.unknown.withLo 0)
   | _ => none
 
-/-- Seed flow state from function parameters. -/
+/-- Seed flow state from function parameters. Also seeds, for every
+    parameter, the trivial fact `name <= "@name"` — an immutable marker
+    (`canon` never produces a `@`-prefixed key, so it can't collide with a
+    real expression) standing for "this parameter's value as passed by
+    the caller". True by construction at function entry; what makes it
+    useful is that `transferExprBoundOnAssign`'s self-subtraction step
+    (FEL-56/57/58) can carry it forward across a `W = W - offset`-shaped
+    reassignment, and `clipPostcondition` across the "saturating clip"
+    idiom — both are exactly the shapes libheif's overlay clipping uses to
+    shrink `in_w`/`in_h` before they're used as a flattened-index capacity
+    (`BoundsCheck.check2DIndex`), where the CALLER's original argument —
+    not whatever the parameter has been reassigned to by the time of the
+    access — is the value that actually bounds the allocation. -/
 def initFlowStateFromParams (params : List Syntax.Param) : FlowState :=
   params.foldl
     (fun st p =>
@@ -99,9 +112,11 @@ def initFlowStateFromParams (params : List Syntax.Param) : FlowState :=
         match ptrStateForParam p.ty with
         | some ps => st1.setPtr p.name ps
         | none => st1
-      match initialRangeForParam p.ty with
-      | some r => st2.setRange p.name r
-      | none => st2)
+      let st3 :=
+        match initialRangeForParam p.ty with
+        | some r => st2.setRange p.name r
+        | none => st2
+      st3.setExprBound p.name ("@" ++ p.name))
     FlowState.empty
 
 private partial def branchEndsWithReturn (stmts : List Syntax.Stmt) : Bool :=
@@ -155,6 +170,23 @@ private partial def inferTransitiveBounds (cond : Syntax.Expr) (state : FlowStat
       inferTransitiveBounds rhs s1
   | _ => state
 
+/-- Parallel to `inferTransitiveBounds`, but for the scoped symbolic
+    exprBounds table (FEL-56/57/58): unconditionally records
+    `canon(lhs) <= canon(rhs)` for a `<`/`<=` loop condition, regardless of
+    whether either side is a plain tracked variable or has a numeric
+    bound. This is what lets `while (col < in_w)` relate `col` to `in_w`
+    symbolically even though `in_w` is a parameter with no numeric value —
+    see `CCC/Verify/Canon.lean`'s docstring for what canon-equality does
+    and does not prove. -/
+private def inferExprBoundFromCond (ctx : VerifyCtx) (cond : Syntax.Expr) (state : FlowState)
+    : FlowState :=
+  match cond with
+  | .binOp .lt lhs rhs _ => state.setExprBound (canon ctx.program lhs) (canon ctx.program rhs)
+  | .binOp .le lhs rhs _ => state.setExprBound (canon ctx.program lhs) (canon ctx.program rhs)
+  | .binOp .and_ lhs rhs _ =>
+      inferExprBoundFromCond ctx rhs (inferExprBoundFromCond ctx lhs state)
+  | _ => state
+
 -- ══════════════════════════════════════════════════════════════
 -- Loop fixpoint (FEL-43). A single-pass analysis of a loop body only ever
 -- sees "iteration 1 starting from the pre-loop state" — a use-after-free
@@ -201,6 +233,190 @@ private partial def fixpointBody (oneIter : FlowState → FlowState) (entry : Fl
   { FlowState.merge settled finalAfter with
       violations := finalAfter.violations
       evidence := finalAfter.evidence }
+
+-- ══════════════════════════════════════════════════════════════
+-- FEL-56/57/58 (libheif-class detection, scoped): recognize the
+-- "saturating clip" idiom and a coarse interprocedural pointer-capacity
+-- inference. See CCC/Verify/Canon.lean's docstring for the soundness
+-- contract these build on. Neither is a general relational/interprocedural
+-- system — see FEL-56/57/58 in Linear for what's still open.
+-- ══════════════════════════════════════════════════════════════
+
+/-- Assignment statements appearing directly in a statement list (not
+    inside a nested loop/if — this idiom's clip assignment is always a
+    single top-level statement in the guard's body). -/
+private partial def collectTopLevelAssigns (stmts : List Syntax.Stmt)
+    : List (Syntax.Expr × Syntax.Expr) :=
+  (stmts.map (fun s =>
+    match s with
+    | .exprStmt (.assign lhs rhs _) _ => [(lhs, rhs)]
+    | .block ss _ => collectTopLevelAssigns ss
+    | _ => [])).flatten
+
+private def firstSome {α β : Type} (xs : List α) (f : α → Option β) : Option β :=
+  match xs with
+  | [] => none
+  | x :: rest => match f x with | some v => some v | none => firstSome rest f
+
+/-- `if (SUM > BOUND) { KEY := BOUND - OTHER; }` with no else, where `SUM`
+    is structurally `OTHER + KEY` (either order) — establishes the
+    postcondition `OTHER + KEY <= BOUND` regardless of which branch
+    executes: by the negated condition if not taken, algebraically (the
+    subtraction exactly cancels) if taken. Returns
+    `(canon(OTHER+KEY), canon(BOUND), canon(KEY))` on a match — the third
+    element lets the caller ALSO chain KEY's own pre-existing bound
+    forward across this statement (see the `.ifElse` case below): KEY's
+    new value is <= its old value in BOTH branches here (unchanged in the
+    implicit else; `BOUND - OTHER` is exactly what the guard condition
+    `OTHER + KEY_old > BOUND` proves is smaller than `KEY_old` in the
+    then-branch), so whatever KEY was already known to be bounded by
+    remains a valid bound after this idiom, however many times removed
+    from the parameter's original entry value. This is the general,
+    reusable "clip idiom" this ticket's corpus entry needs — see
+    `docs/corpus-results.md` / Linear FEL-56 for exactly what it does and
+    does not prove. -/
+private def clipPostcondition (ctx : VerifyCtx) (cond : Syntax.Expr)
+    (thenBody elseBody : List Syntax.Stmt) : Option (String × String × String) :=
+  if !elseBody.isEmpty then none else
+  match cond with
+  | .binOp op sumExpr boundExpr _ =>
+      if op != .gt && op != .ge then none else
+      match sumExpr with
+      | .binOp .add opA opB _ =>
+          let assigns := collectTopLevelAssigns thenBody
+          firstSome assigns (fun (lhs, rhs) =>
+            let keyC := canon ctx.program lhs
+            let otherOpt : Option Syntax.Expr :=
+              if canon ctx.program opA == keyC then some opB
+              else if canon ctx.program opB == keyC then some opA
+              else none
+            match otherOpt with
+            | none => none
+            | some otherExpr =>
+                let rhs' := match rhs with
+                  | .cast _ inner _ => inner
+                  | _ => rhs
+                match rhs' with
+                | .binOp .sub b' o' _ =>
+                    if canon ctx.program b' == canon ctx.program boundExpr &&
+                       canon ctx.program o' == canon ctx.program otherExpr then
+                      some (canon ctx.program (Syntax.Expr.binOp .add otherExpr lhs { line := 0, col := 0 }),
+                            canon ctx.program boundExpr,
+                            keyC)
+                    else none
+                | _ => none)
+      | _ => none
+  | _ => none
+
+/-- Every `varDecl`/assignment of the shape `name = malloc(A*B)` /
+    `name = calloc(A,B)` inside one function's body (syntactic only, no
+    FlowState needed — used only to build the whole-program capacity
+    table below). -/
+private partial def stmtMallocFactors (s : Syntax.Stmt)
+    : List (String × Syntax.Expr × Syntax.Expr) :=
+  let ofInit (name : String) (initExpr : Syntax.Expr) : List (String × Syntax.Expr × Syntax.Expr) :=
+    match initExpr with
+    | .call "malloc" [.binOp .mul a b _] _ => [(name, a, b)]
+    | .call "calloc" [a, b] _ => [(name, a, b)]
+    | _ => []
+  match s with
+  | .varDecl name _ (some initExpr) _ => ofInit name initExpr
+  | .exprStmt (.assign (.var name _) rhs _) _ => ofInit name rhs
+  | .block ss _ => (ss.map stmtMallocFactors).flatten
+  | .ifElse _ t e _ => (t.map stmtMallocFactors).flatten ++ (e.map stmtMallocFactors).flatten
+  | .while_ _ b _ => (b.map stmtMallocFactors).flatten
+  | .for_ _ _ _ b _ => (b.map stmtMallocFactors).flatten
+  | .doWhile b _ _ => (b.map stmtMallocFactors).flatten
+  | .switch_ _ cases _ => (cases.map (fun c => (c.2.1.map stmtMallocFactors).flatten)).flatten
+  | .label_ _ body _ => stmtMallocFactors body
+  | _ => []
+
+private partial def collectCallsExpr (e : Syntax.Expr) : List (String × List Syntax.Expr) :=
+  match e with
+  | .call fn args _ => (fn, args) :: (args.map collectCallsExpr).flatten
+  | .binOp _ l r _ => collectCallsExpr l ++ collectCallsExpr r
+  | .unOp _ o _ => collectCallsExpr o
+  | .index a i _ => collectCallsExpr a ++ collectCallsExpr i
+  | .member o _ _ => collectCallsExpr o
+  | .arrow p _ _ => collectCallsExpr p
+  | .assign l r _ => collectCallsExpr l ++ collectCallsExpr r
+  | .ternary c t e2 _ => collectCallsExpr c ++ collectCallsExpr t ++ collectCallsExpr e2
+  | .cast _ o _ => collectCallsExpr o
+  | .comma l r _ => collectCallsExpr l ++ collectCallsExpr r
+  | .initList es _ => (es.map collectCallsExpr).flatten
+  | .callFnPtr f args _ => collectCallsExpr f ++ (args.map collectCallsExpr).flatten
+  | _ => []
+
+private partial def stmtCalls (s : Syntax.Stmt) : List (String × List Syntax.Expr) :=
+  match s with
+  | .varDecl _ _ init _ => match init with | some e => collectCallsExpr e | none => []
+  | .exprStmt e _ => collectCallsExpr e
+  | .ret v _ => match v with | some e => collectCallsExpr e | none => []
+  | .ifElse c t e _ =>
+      collectCallsExpr c ++ (t.map stmtCalls).flatten ++ (e.map stmtCalls).flatten
+  | .while_ c b _ => collectCallsExpr c ++ (b.map stmtCalls).flatten
+  | .for_ i c st b _ =>
+      (match i with | some s2 => stmtCalls s2 | none => []) ++
+      (match c with | some e => collectCallsExpr e | none => []) ++
+      (match st with | some e => collectCallsExpr e | none => []) ++
+      (b.map stmtCalls).flatten
+  | .block ss _ => (ss.map stmtCalls).flatten
+  | .switch_ scrut cases _ =>
+      collectCallsExpr scrut ++ (cases.map (fun c => (c.2.1.map stmtCalls).flatten)).flatten
+  | .doWhile b c _ => (b.map stmtCalls).flatten ++ collectCallsExpr c
+  | .label_ _ body _ => stmtCalls body
+  | _ => []
+
+/-- FEL-58 (partial, scoped): whole-program scan for the "(pointer, width,
+    height)" parameter-group idiom. If EVERY call site passing a pointer
+    argument known (at that call site) to have byte-capacity `A*B` ALSO
+    passes `A` and `B` at two other positions of the SAME call, infer the
+    callee's parameter at that position has capacity
+    `calleeParam[j] * calleeParam[k]` (using the callee's OWN parameter
+    names). Purely syntactic (no FlowState) — this only needs to notice
+    the SHAPE `malloc(A*B)` feeding a variable that's later passed
+    alongside `A`/`B` positionally; it doesn't need to re-run the
+    verifier. -/
+private def buildParamCapacityTable (prog : Syntax.Program)
+    : List (String × List (Nat × (String × String))) :=
+  let allEntries : List (String × Nat × String × String) :=
+    (prog.functions.map (fun callerFn =>
+      let mallocFactors := (callerFn.body.map stmtMallocFactors).flatten
+      let calls := (callerFn.body.map stmtCalls).flatten
+      (calls.map (fun (fnName, args) =>
+        match prog.functions.find? (·.name == fnName) with
+        | none => []
+        | some callee =>
+            let argsIdx := args.zipIdx
+            (argsIdx.map (fun (argExpr, i) =>
+              match argExpr with
+              | .var argName _ =>
+                  match mallocFactors.find? (·.1 == argName) with
+                  | none => []
+                  | some (_, wExpr, hExpr) =>
+                      -- `reprStr` (used elsewhere for opaque error-message
+                      -- text) bakes in each expr's source `Loc`, so two
+                      -- occurrences of the SAME variable at different
+                      -- positions (the malloc call vs. the later argument
+                      -- list) never compare equal that way. `canon` is the
+                      -- position-independent structural key this needs.
+                      let wStr := canon prog wExpr
+                      let hStr := canon prog hExpr
+                      let findPos (target : String) : Option Nat :=
+                        (argsIdx.find? (fun (a, j) => j != i && canon prog a == target)).map (·.2)
+                      match findPos wStr, findPos hStr with
+                      | some j, some k =>
+                          if j == k then [] else
+                          let calleeParamsIdx := callee.params.zipIdx
+                          match (calleeParamsIdx.find? (·.2 == j)).map (·.1),
+                                (calleeParamsIdx.find? (·.2 == k)).map (·.1) with
+                          | some pj, some pk => [(fnName, i, pj.name, pk.name)]
+                          | _, _ => []
+                      | _, _ => []
+              | _ => [])).flatten)).flatten)).flatten
+  let names := allEntries.foldl (fun acc e => if acc.contains e.1 then acc else acc ++ [e.1]) []
+  names.map (fun name =>
+    (name, (allEntries.filter (·.1 == name)).map (fun e => (e.2.1, (e.2.2.1, e.2.2.2)))))
 
 mutual
 
@@ -258,13 +474,24 @@ partial def analyzeStmt (ctx : VerifyCtx) (stmt : Syntax.Stmt) (state : FlowStat
       else if elseReturns && !thenReturns then
         { thenEnd with violations := combinedV, evidence := combinedE }
       else
-        { FlowState.merge thenEnd elseEnd with violations := combinedV, evidence := combinedE }
+        let merged := { FlowState.merge thenEnd elseEnd with violations := combinedV, evidence := combinedE }
+        match clipPostcondition ctx cond thenBody elseBody with
+        | some (sumC, boundC, keyC) =>
+            let merged1 := merged.setExprBound sumC boundC
+            -- Chain KEY's pre-existing bound (its function-entry marker,
+            -- or whatever it had already been narrowed to by an earlier
+            -- clip) forward across this reassignment — see the docstring
+            -- on `clipPostcondition` above for why this is sound.
+            match sCond.getExprBound keyC with
+            | some priorBound => merged1.setExprBound keyC priorBound
+            | none => merged1
+        | none => merged
 
   | .while_ cond body _ =>
       let (thenFacts, elseFacts) := extractFacts cond
       let oneIter : FlowState → FlowState := fun st =>
         let sCondIter := applyExprChecks ctx cond st
-        let bodyStart := inferTransitiveBounds cond (applyFacts thenFacts sCondIter)
+        let bodyStart := inferExprBoundFromCond ctx cond (inferTransitiveBounds cond (applyFacts thenFacts sCondIter))
         analyzeStmts ctx body bodyStart
       let bodyResult := fixpointBody oneIter state
       let exitState := silently (fun st => applyFacts elseFacts (applyExprChecks ctx cond st)) state
@@ -290,7 +517,7 @@ partial def analyzeStmt (ctx : VerifyCtx) (stmt : Syntax.Stmt) (state : FlowStat
         let bodyStart0 := applyFacts thenFacts sCond
         let bodyStart :=
           match cond with
-          | some condExpr => inferTransitiveBounds condExpr bodyStart0
+          | some condExpr => inferExprBoundFromCond ctx condExpr (inferTransitiveBounds condExpr bodyStart0)
           | none => bodyStart0
         let bodyEnd0 := analyzeStmts ctx body bodyStart
         match step with
@@ -360,6 +587,8 @@ private partial def stmtHasGoto (s : Syntax.Stmt) : Bool :=
 
 /-- Verify one function body. -/
 def verifyFunction (ctx : VerifyCtx) (f : Syntax.FunDef) : Syntax.FunVerifyResult :=
+  let paramIdx := f.params.zipIdx.map (fun (p, i) => (p.name, i))
+  let ctx := { ctx with currentFun := f.name, currentParamIndex := paramIdx }
   let initState := initFlowStateFromParams f.params
   let finalState := analyzeStmts ctx f.body initState
   let status : Syntax.VerifyStatus :=
@@ -373,13 +602,15 @@ def verifyFunction (ctx : VerifyCtx) (f : Syntax.FunDef) : Syntax.FunVerifyResul
 def verifyProgramReport (prog : Syntax.Program) : Syntax.ProgramVerifyResult :=
   -- Phase 0: Symbol validation (undefined functions, arity mismatches)
   let symbolViolations := SymbolCheck.checkProgram prog
-  -- Phase 0.5: coarse whole-program "frees its parameter" summaries (FEL-48)
+  -- Phase 0.5: coarse whole-program summaries (FEL-48, FEL-58 partial)
   let freesTable := buildFreesParamTable prog
+  let capacityTable := buildParamCapacityTable prog
   -- Phase 1: Per-function flow-sensitive analysis
-  let baseCtx : VerifyCtx := { structs := prog.structs, currentFun := "", funcFreesParam := freesTable }
+  let baseCtx : VerifyCtx :=
+    { structs := prog.structs, currentFun := "", funcFreesParam := freesTable
+      program := prog, paramCapacity := capacityTable }
   let results : List Syntax.FunVerifyResult :=
-    prog.functions.map (fun f =>
-      verifyFunction { baseCtx with currentFun := f.name } f)
+    prog.functions.map (fun f => verifyFunction baseCtx f)
   -- Prepend symbol violations as a synthetic result
   let symbolResult : Syntax.FunVerifyResult :=
     { funName := "program"
