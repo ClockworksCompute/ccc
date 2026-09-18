@@ -167,6 +167,7 @@ lake build ccc
 lake env lean --run test/AArch64Test.lean         # 34/34 — backend execution
 lake env lean --run test/IntegrationTest.lean      # 22/22 — E2E programs
 lake env lean --run test/HardeningTest.lean        #  8/8  — edge cases
+lake env lean --run test/SignednessTest.lean       #  8/8  — signed int/short/char codegen
 lake env lean --run test/Phase2Features.lean       # 37/37 — language features
 lake env lean --run test/PreprocessTest.lean       # 14/14 — preprocessor
 lake env lean --run test/TypedefTest.lean          # 10/10 — typedef resolution
