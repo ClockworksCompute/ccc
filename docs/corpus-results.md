@@ -1,5 +1,76 @@
 # CVE regression corpus — baseline results
 
+## 2026-09-19 (update) — measured after the FEL-40..49 verifier fixes
+
+**Against commit:** `a1e70438e097713bfed3a8db998d86478ec0866f` (branch
+`epic/libheif-class-detection`, after the force-emit removal, range/bounds
+domain, struct-field pointer tracking, and malloc/calloc/realloc tracking
+landed). The section below this one is the ORIGINAL baseline (measured
+before those fixes, against `cf2f0a5`) — kept for comparison, since the
+whole point of this corpus is to make exactly this kind of before/after
+comparison possible.
+
+```
+ENTRY                              VULN          FIXED         CLASS            NOTES
+------------------------------------------------------------------------------------------
+libheif-overlay-85e21ad            rejected      rejected      false-positive   fixed.c flagged at line 130
+libpng-cve-2015-8126               rejected      rejected      false-positive   fixed.c flagged at line 52
+libpng-cve-2018-13785              accepted      accepted      missed           bug not flagged
+libwebp-cve-2023-4863              parse-failed  parse-failed  parse-failed     -
+------------------------------------------------------------------------------------------
+
+SUMMARY: 4 entries -- detected=0 missed=1 false-positive=2 parse-failed=1 timeout=0
+```
+
+Still 0/4 *detected* by the scoreboard's strict definition (reject the
+vulnerable version AND accept the fixed one) — that's expected: the
+CVE-relevant bugs here are integer-overflow and pointer-arithmetic shaped,
+and the FEL-56/57/58 work (relational/overflow-aware ranges, a real
+`(base,offset)` pointer model, interprocedural summaries) hasn't landed
+yet. But three things changed, and they're worth spelling out because
+"still 0/4" undersells what actually moved:
+
+- **`libheif-overlay-85e21ad` moved from `missed` to `false-positive`.**
+  The verifier now genuinely rejects BOTH files — but for the WRONG
+  reason: it flags `out_p[i] = 0;`/`in_p[i] = 1;` (buffer-init loops) as a
+  possible null-pointer dereference, because FEL-47 now correctly tracks
+  `malloc(out_w*out_h)` (a non-constant size) as a `nullable` pointer that
+  needs a null check — and this synthetic test harness's `main()`, like a
+  lot of throwaway test code, never bothers null-checking its `malloc`
+  calls. That's a *real* finding (these mallocs genuinely aren't
+  null-checked), just not *the* CVE-relevant one (the overlay clipping
+  arithmetic), and it fires identically on both files so the scoreboard
+  can't credit it as a detection. This is a legitimate before/after
+  improvement in the verifier (FEL-47 working as intended) that the
+  scoreboard's coarse detected/missed/false-positive taxonomy doesn't have
+  a label for; a future refinement could distinguish "rejected, but for a
+  provably different reason on each file" from "rejected identically".
+- **`libpng-cve-2015-8126` stayed `false-positive`** (same identical
+  violation on both — `fixed.c` flagged at line 52 now instead of line 33,
+  because the range/bounds rewrite changed which check fires first, not
+  because the underlying gap closed).
+- **`libwebp-cve-2023-4863` moved from `false-positive` to `parse-failed`.**
+  This is NOT a parser regression from this work — it surfaces a
+  pre-existing, unrelated front-end gap: `typedef struct HuffmanCode {
+  ... } HuffmanCode;` (a struct typedef'd under its own tag name) is
+  parsed by skipping the field list entirely (`CCC/Parse/Parse.lean`'s
+  `parseTypedefDecl` only records the tag as an opaque `struct_` type for
+  this shape; a bare `struct HuffmanCode { ... };` without the typedef
+  wrapper does NOT have this problem). Previously the file was rejected by
+  the verifier before ever reaching code generation, so the emitter's
+  resulting "unknown field 'bits'" error was silently swallowed by the
+  old force-emit fallback (`Pipeline.lean`'s pre-FEL-40 code discarded a
+  *second* error from the force-emit attempt and kept showing the
+  verifier's original violation text). FEL-47's more accurate tracking
+  means THIS file's actual bug is no longer flagged by the verifier at
+  all (a miss, same underlying cause as the libheif entry above — the
+  real overlow bug is pointer-arithmetic shaped, FEL-44/57), so it now
+  proceeds to code generation for real and the pre-existing struct-field
+  gap becomes visible instead of masked. Tracked as a front-end
+  completeness gap under FEL-55.
+
+## Original baseline (measured 2026-09-19, before the FEL-40..49 fixes)
+
 **Measured:** 2026-09-19
 **Against commit:** `cf2f0a503c0269d47bc6467e088dd8681570944c` (branch
 `epic/libheif-class-detection`, the tip before this corpus was added)

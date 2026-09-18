@@ -12,9 +12,18 @@ def usage : String :=
   "Usage: ccc <input.c> [-o <output>]\n" ++
   "       ccc -c <input.c> -o <output.s>\n" ++
   "       ccc --verify-report <input.c>\n" ++
+  "       ccc --harden <input.c> -o <output>\n" ++
   "  Compile a C source file with memory safety verification.\n" ++
   "  -c: compile to assembly only (no assembling/linking).\n" ++
   "  --verify-report: print per-function verification status.\n" ++
+  "  --harden: EXPERIMENTAL (FEL-59, in progress). Emit a binary even when\n" ++
+  "    the verifier finds violations it cannot clear, with a loud warning\n" ++
+  "    naming exactly what was not proven. Exit code stays 0. As of this\n" ++
+  "    build this ONLY suppresses the normal reject-and-exit-1 behavior —\n" ++
+  "    it does NOT yet insert runtime bounds/null/UAF checks at the\n" ++
+  "    unproven accesses (that instrumentation is the rest of FEL-59, not\n" ++
+  "    implemented yet). Never use this on untrusted input expecting real\n" ++
+  "    protection; it is a development aid today, not a hardening mode.\n" ++
   "  If no -o specified, only verify (no assembly/linking)."
 
 /-- Find the runtime source file relative to the executable. -/
@@ -89,6 +98,13 @@ def main (args : List String) : IO UInt32 := do
           return 0
   | _ => pure ()
 
+  -- Strip an optional leading `--harden` flag before the usual argument
+  -- shapes (FEL-59, experimental — see the `usage` docstring above for
+  -- exactly what this does and does not do today).
+  let (harden, args) := match args with
+    | "--harden" :: rest => (true, rest)
+    | _ => (false, args)
+
   -- Parse arguments
   let (inputFile, outputFile, compileOnly) ← do
     match args with
@@ -105,11 +121,21 @@ def main (args : List String) : IO UInt32 := do
   -- Extract filename for reporting
   let filename := (inputFile.splitOn "/").getLast!
 
-  -- Compile
-  let result := CCC.compile source filename
+  -- Compile. `--harden` uses the explicit force-emit escape hatch instead
+  -- of the safe default (see FEL-40/FEL-59) and prints a loud disclaimer
+  -- whenever it actually needed to.
+  let result := if harden then CCC.compileIgnoringViolations source filename
+                else CCC.compile source filename
 
   -- Print report
   IO.println result.report
+  if harden && !result.violations.isEmpty then
+    IO.println ""
+    IO.println "⚠️  --harden: emitting despite unproven access(es) above."
+    IO.println "⚠️  No runtime checks were inserted for them (FEL-59 is not"
+    IO.println "⚠️  finished) — this binary can still misbehave exactly like"
+    IO.println "⚠️  an unverified C program on the inputs those violations"
+    IO.println "⚠️  named. Do not treat this as a safe binary."
 
   -- FEL-40: `CCC.compile` never produces assembly for a program with
   -- violations (parse error, verification failure, or emission error all
