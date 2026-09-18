@@ -59,11 +59,16 @@ inductive ArmInstr where
   | movk (rd : ArmReg) (imm : Nat) (shift : Nat)    -- movk rd, #imm, lsl #shift
   -- Load/store
   | ldr (rt : ArmReg) (rn : ArmReg) (off : Int)     -- ldr rt, [rn, #off]
-  | ldr_w (rt : ArmReg) (rn : ArmReg) (off : Int)   -- ldr wt, [rn, #off] (32-bit)
-  | ldrb (rt : ArmReg) (rn : ArmReg) (off : Int)    -- ldrb wt, [rn, #off] (byte)
+  | ldr_w (rt : ArmReg) (rn : ArmReg) (off : Int)   -- ldr wt, [rn, #off] (32-bit, zero-extends)
+  | ldrb (rt : ArmReg) (rn : ArmReg) (off : Int)    -- ldrb wt, [rn, #off] (byte, zero-extends)
+  | ldrh (rt : ArmReg) (rn : ArmReg) (off : Int)    -- ldrh wt, [rn, #off] (halfword, zero-extends)
+  | ldrsw (rt : ArmReg) (rn : ArmReg) (off : Int)   -- ldrsw xt, [rn, #off] (word, sign-extends to 64)
+  | ldrsh (rt : ArmReg) (rn : ArmReg) (off : Int)   -- ldrsh xt, [rn, #off] (halfword, sign-extends to 64)
+  | ldrsb (rt : ArmReg) (rn : ArmReg) (off : Int)   -- ldrsb xt, [rn, #off] (byte, sign-extends to 64)
   | str (rt : ArmReg) (rn : ArmReg) (off : Int)     -- str rt, [rn, #off]
   | str_w (rt : ArmReg) (rn : ArmReg) (off : Int)   -- str wt, [rn, #off] (32-bit)
   | strb (rt : ArmReg) (rn : ArmReg) (off : Int)    -- strb wt, [rn, #off] (byte)
+  | strh (rt : ArmReg) (rn : ArmReg) (off : Int)    -- strh wt, [rn, #off] (halfword)
   | stp (rt1 : ArmReg) (rt2 : ArmReg) (rn : ArmReg) (off : Int)  -- stp, pre-index
   | ldp (rt1 : ArmReg) (rt2 : ArmReg) (rn : ArmReg) (off : Int)  -- ldp, post-index
   -- Address computation
@@ -76,8 +81,12 @@ inductive ArmInstr where
   | sub_reg (rd : ArmReg) (rn : ArmReg) (rm : ArmReg)
   | mul_reg (rd : ArmReg) (rn : ArmReg) (rm : ArmReg)
   | sdiv (rd : ArmReg) (rn : ArmReg) (rm : ArmReg)
+  | udiv (rd : ArmReg) (rn : ArmReg) (rm : ArmReg)
   | msub (rd : ArmReg) (rn : ArmReg) (rm : ArmReg) (ra : ArmReg)  -- rd = ra - rn*rm
   | neg (rd : ArmReg) (rn : ArmReg)
+  -- Width conversion
+  | sxtw (rd : ArmReg) (rn : ArmReg)                 -- sxtw xd, wn (sign-extend low 32 bits to 64)
+  | uxtw (rd : ArmReg) (rn : ArmReg)                 -- uxtw xd, wn (zero-extend low 32 bits to 64)
   -- Bitwise
   | and_reg (rd : ArmReg) (rn : ArmReg) (rm : ArmReg)
   | orr_reg (rd : ArmReg) (rn : ArmReg) (rm : ArmReg)
@@ -112,9 +121,14 @@ def ArmInstr.render : ArmInstr → String
   | .ldr rt rn off => s!"    ldr {rt.toStr64}, [{rn.toStr64}, #{off}]"
   | .ldr_w rt rn off => s!"    ldr {rt.toStr32}, [{rn.toStr64}, #{off}]"
   | .ldrb rt rn off => s!"    ldrb {rt.toStr32}, [{rn.toStr64}, #{off}]"
+  | .ldrh rt rn off => s!"    ldrh {rt.toStr32}, [{rn.toStr64}, #{off}]"
+  | .ldrsw rt rn off => s!"    ldrsw {rt.toStr64}, [{rn.toStr64}, #{off}]"
+  | .ldrsh rt rn off => s!"    ldrsh {rt.toStr64}, [{rn.toStr64}, #{off}]"
+  | .ldrsb rt rn off => s!"    ldrsb {rt.toStr64}, [{rn.toStr64}, #{off}]"
   | .str rt rn off => s!"    str {rt.toStr64}, [{rn.toStr64}, #{off}]"
   | .str_w rt rn off => s!"    str {rt.toStr32}, [{rn.toStr64}, #{off}]"
   | .strb rt rn off => s!"    strb {rt.toStr32}, [{rn.toStr64}, #{off}]"
+  | .strh rt rn off => s!"    strh {rt.toStr32}, [{rn.toStr64}, #{off}]"
   | .stp rt1 rt2 rn off => s!"    stp {rt1.toStr64}, {rt2.toStr64}, [{rn.toStr64}, #{off}]!"
   | .ldp rt1 rt2 rn off => s!"    ldp {rt1.toStr64}, {rt2.toStr64}, [{rn.toStr64}, #{off}]"
   | .adrp rd sym => s!"    adrp {rd.toStr64}, {sym}@PAGE"
@@ -125,8 +139,11 @@ def ArmInstr.render : ArmInstr → String
   | .sub_reg rd rn rm => s!"    sub {rd.toStr64}, {rn.toStr64}, {rm.toStr64}"
   | .mul_reg rd rn rm => s!"    mul {rd.toStr64}, {rn.toStr64}, {rm.toStr64}"
   | .sdiv rd rn rm => s!"    sdiv {rd.toStr64}, {rn.toStr64}, {rm.toStr64}"
+  | .udiv rd rn rm => s!"    udiv {rd.toStr64}, {rn.toStr64}, {rm.toStr64}"
   | .msub rd rn rm ra => s!"    msub {rd.toStr64}, {rn.toStr64}, {rm.toStr64}, {ra.toStr64}"
   | .neg rd rn => s!"    neg {rd.toStr64}, {rn.toStr64}"
+  | .sxtw rd rn => s!"    sxtw {rd.toStr64}, {rn.toStr32}"
+  | .uxtw rd rn => s!"    uxtw {rd.toStr64}, {rn.toStr32}"
   | .and_reg rd rn rm => s!"    and {rd.toStr64}, {rn.toStr64}, {rm.toStr64}"
   | .orr_reg rd rn rm => s!"    orr {rd.toStr64}, {rn.toStr64}, {rm.toStr64}"
   | .eor_reg rd rn rm => s!"    eor {rd.toStr64}, {rn.toStr64}, {rm.toStr64}"

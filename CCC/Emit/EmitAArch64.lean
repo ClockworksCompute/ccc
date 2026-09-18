@@ -76,52 +76,58 @@ def emitAddOrSubImm (rd : ArmReg) (rn : ArmReg) (off : Int) : ArmCodegenM Unit :
   else
     emitArmInstr (.sub_imm rd rn (-off))
 
-/-- Load from [x29, #off] with correct size instruction.
+/-- Load a value of type `ty` from [`rn`, #`off`] into x0, choosing the width- and
+    signedness-correct instruction: sign-extending loads (`ldrsb`/`ldrsh`/`ldrsw`) for signed
+    sub-word C types (so e.g. a negative `int`/`short`/`char` reloads correctly as a negative
+    64-bit value), zero-extending loads (`ldrb`/`ldrh`/`ldr w`) for unsigned ones. -/
+def emitArmLoadWidth (structDefs : List StructDef) (typedefs : List TypedefDecl)
+    (rn : ArmReg) (off : Int) (ty : CType) : ArmCodegenM Unit := do
+  let sz := cTypeSize structDefs ty
+  let signed := isSignedTy (resolveType typedefs ty)
+  if sz = 1 then
+    if signed then emitArmInstr (.ldrsb .x0 rn off) else emitArmInstr (.ldrb .x0 rn off)
+  else if sz = 2 then
+    if signed then emitArmInstr (.ldrsh .x0 rn off) else emitArmInstr (.ldrh .x0 rn off)
+  else if sz ≤ 4 then
+    if signed then emitArmInstr (.ldrsw .x0 rn off) else emitArmInstr (.ldr_w .x0 rn off)
+  else
+    emitArmInstr (.ldr .x0 rn off)
+
+/-- Store `reg` to [`rn`, #`off`] with the instruction matching a `sz`-byte C type. -/
+def emitArmStoreWidth (reg : ArmReg) (rn : ArmReg) (off : Int) (sz : Nat) : ArmCodegenM Unit := do
+  if sz = 1 then      emitArmInstr (.strb reg rn off)
+  else if sz = 2 then emitArmInstr (.strh reg rn off)
+  else if sz ≤ 4 then emitArmInstr (.str_w reg rn off)
+  else                 emitArmInstr (.str reg rn off)
+
+/-- Load from [x29, #off] with correct size + signedness instruction.
     When |off| > 255, use scratch x9 to materialise the address first
     (AArch64 unscaled load/store only supports [-256, 255]). -/
-def emitLoadLocal (off : Int) (sz : Nat) : ArmCodegenM Unit := do
+def emitLoadLocal (structDefs : List StructDef) (typedefs : List TypedefDecl)
+    (off : Int) (ty : CType) : ArmCodegenM Unit := do
   if off.natAbs > 255 then
     emitAddOrSubImm .x9 .x29 off
-    if sz = 1 then      emitArmInstr (.ldrb .x0 .x9 0)
-    else if sz ≤ 4 then emitArmInstr (.ldr_w .x0 .x9 0)
-    else                 emitArmInstr (.ldr .x0 .x9 0)
+    emitArmLoadWidth structDefs typedefs .x9 0 ty
   else
-    if sz = 1 then      emitArmInstr (.ldrb .x0 .x29 off)
-    else if sz ≤ 4 then emitArmInstr (.ldr_w .x0 .x29 off)
-    else                 emitArmInstr (.ldr .x0 .x29 off)
+    emitArmLoadWidth structDefs typedefs .x29 off ty
 
 /-- Store to [x29, #off] with correct size instruction.
     When |off| > 255, use scratch x9 to materialise the address first. -/
 def emitStoreLocal (reg : ArmReg) (off : Int) (sz : Nat) : ArmCodegenM Unit := do
   if off.natAbs > 255 then
     emitAddOrSubImm .x9 .x29 off
-    if sz = 1 then      emitArmInstr (.strb reg .x9 0)
-    else if sz ≤ 4 then emitArmInstr (.str_w reg .x9 0)
-    else                 emitArmInstr (.str reg .x9 0)
+    emitArmStoreWidth reg .x9 0 sz
   else
-    if sz = 1 then      emitArmInstr (.strb reg .x29 off)
-    else if sz ≤ 4 then emitArmInstr (.str_w reg .x29 off)
-    else                 emitArmInstr (.str reg .x29 off)
+    emitArmStoreWidth reg .x29 off sz
 
-/-- Load value from address in x0 based on type -/
+/-- Load value from address in x0 based on type (width + signedness aware). -/
 def emitArmLoadFromAddr (ty : CType) : ArmCodegenM Unit := do
   let st ← get
-  let sz := cTypeSize st.structDefs ty
-  if sz = 1 then
-    emitArmInstr (.ldrb .x0 .x0 0)
-  else if sz ≤ 4 then
-    emitArmInstr (.ldr_w .x0 .x0 0)
-  else
-    emitArmInstr (.ldr .x0 .x0 0)
+  emitArmLoadWidth st.structDefs st.typedefs .x0 0 ty
 
 /-- Store x1 to address in x0 based on type size -/
 def emitArmStoreToAddr (sz : Nat) : ArmCodegenM Unit := do
-  if sz = 1 then
-    emitArmInstr (.strb .x1 .x0 0)
-  else if sz ≤ 4 then
-    emitArmInstr (.str_w .x1 .x0 0)
-  else
-    emitArmInstr (.str .x1 .x0 0)
+  emitArmStoreWidth .x1 .x0 0 sz
 
 -- ═══════════════════════════════════════════════════════════════
 -- Expression and statement codegen
@@ -246,46 +252,74 @@ partial def emitArmExpr (env : TypeEnv) (expr : Expr) : ArmCodegenM Unit := do
           | .array _ _ =>
               emitAddOrSubImm .x0 .x29 off
           | _ =>
-              let sz := cTypeSize st.structDefs ty
-              emitLoadLocal off sz
+              emitLoadLocal st.structDefs st.typedefs off ty
   | .binOp op lhs rhs _ =>
       match op with
       | .add =>
+          let st ← get
+          let lty := resolveType st.typedefs (inferExprType env st.structDefs lhs)
+          let rty := resolveType st.typedefs (inferExprType env st.structDefs rhs)
           emitArmExpr env lhs
           emitArmPush .x0
           emitArmExpr env rhs
           emitArmInstr (.mov_reg .x1 .x0)
           emitArmPop .x0
           emitArmInstr (.add_reg .x0 .x0 .x1)
+          match narrowIntTruncKind st.structDefs lty rty with
+          | some true => emitArmInstr (.sxtw .x0 .x0)
+          | some false => emitArmInstr (.uxtw .x0 .x0)
+          | none => pure ()
       | .sub =>
+          let st ← get
+          let lty := resolveType st.typedefs (inferExprType env st.structDefs lhs)
+          let rty := resolveType st.typedefs (inferExprType env st.structDefs rhs)
           emitArmExpr env lhs
           emitArmPush .x0
           emitArmExpr env rhs
           emitArmInstr (.mov_reg .x1 .x0)
           emitArmPop .x0
           emitArmInstr (.sub_reg .x0 .x0 .x1)
+          match narrowIntTruncKind st.structDefs lty rty with
+          | some true => emitArmInstr (.sxtw .x0 .x0)
+          | some false => emitArmInstr (.uxtw .x0 .x0)
+          | none => pure ()
       | .mul =>
+          let st ← get
+          let lty := resolveType st.typedefs (inferExprType env st.structDefs lhs)
+          let rty := resolveType st.typedefs (inferExprType env st.structDefs rhs)
           emitArmExpr env lhs
           emitArmPush .x0
           emitArmExpr env rhs
           emitArmInstr (.mov_reg .x1 .x0)
           emitArmPop .x0
           emitArmInstr (.mul_reg .x0 .x0 .x1)
+          match narrowIntTruncKind st.structDefs lty rty with
+          | some true => emitArmInstr (.sxtw .x0 .x0)
+          | some false => emitArmInstr (.uxtw .x0 .x0)
+          | none => pure ()
       | .div =>
+          let st ← get
+          let signed := isSignedTy (resolveType st.typedefs (inferExprType env st.structDefs lhs))
+                     && isSignedTy (resolveType st.typedefs (inferExprType env st.structDefs rhs))
           emitArmExpr env lhs
           emitArmPush .x0
           emitArmExpr env rhs
           emitArmInstr (.mov_reg .x1 .x0)
           emitArmPop .x0
-          emitArmInstr (.sdiv .x0 .x0 .x1)
+          if signed then emitArmInstr (.sdiv .x0 .x0 .x1)
+          else emitArmInstr (.udiv .x0 .x0 .x1)
       | .mod =>
+          let st ← get
+          let signed := isSignedTy (resolveType st.typedefs (inferExprType env st.structDefs lhs))
+                     && isSignedTy (resolveType st.typedefs (inferExprType env st.structDefs rhs))
           emitArmExpr env lhs
           emitArmPush .x0
           emitArmExpr env rhs
           emitArmInstr (.mov_reg .x1 .x0)
           emitArmPop .x0
           -- x0 = lhs, x1 = rhs; x0 % x1 = lhs - (lhs/rhs)*rhs
-          emitArmInstr (.sdiv .x9 .x0 .x1)
+          if signed then emitArmInstr (.sdiv .x9 .x0 .x1)
+          else emitArmInstr (.udiv .x9 .x0 .x1)
           emitArmInstr (.msub .x0 .x9 .x1 .x0)
       | .eq =>
           emitArmExpr env lhs
@@ -304,37 +338,49 @@ partial def emitArmExpr (env : TypeEnv) (expr : Expr) : ArmCodegenM Unit := do
           emitArmInstr (.cmp_reg .x0 .x1)
           emitArmInstr (.cset .x0 "ne")
       | .lt =>
+          let st ← get
+          let signed := isSignedTy (resolveType st.typedefs (inferExprType env st.structDefs lhs))
+                     && isSignedTy (resolveType st.typedefs (inferExprType env st.structDefs rhs))
           emitArmExpr env lhs
           emitArmPush .x0
           emitArmExpr env rhs
           emitArmInstr (.mov_reg .x1 .x0)
           emitArmPop .x0
           emitArmInstr (.cmp_reg .x0 .x1)
-          emitArmInstr (.cset .x0 "lt")
+          emitArmInstr (.cset .x0 (if signed then "lt" else "lo"))
       | .gt =>
+          let st ← get
+          let signed := isSignedTy (resolveType st.typedefs (inferExprType env st.structDefs lhs))
+                     && isSignedTy (resolveType st.typedefs (inferExprType env st.structDefs rhs))
           emitArmExpr env lhs
           emitArmPush .x0
           emitArmExpr env rhs
           emitArmInstr (.mov_reg .x1 .x0)
           emitArmPop .x0
           emitArmInstr (.cmp_reg .x0 .x1)
-          emitArmInstr (.cset .x0 "gt")
+          emitArmInstr (.cset .x0 (if signed then "gt" else "hi"))
       | .le =>
+          let st ← get
+          let signed := isSignedTy (resolveType st.typedefs (inferExprType env st.structDefs lhs))
+                     && isSignedTy (resolveType st.typedefs (inferExprType env st.structDefs rhs))
           emitArmExpr env lhs
           emitArmPush .x0
           emitArmExpr env rhs
           emitArmInstr (.mov_reg .x1 .x0)
           emitArmPop .x0
           emitArmInstr (.cmp_reg .x0 .x1)
-          emitArmInstr (.cset .x0 "le")
+          emitArmInstr (.cset .x0 (if signed then "le" else "ls"))
       | .ge =>
+          let st ← get
+          let signed := isSignedTy (resolveType st.typedefs (inferExprType env st.structDefs lhs))
+                     && isSignedTy (resolveType st.typedefs (inferExprType env st.structDefs rhs))
           emitArmExpr env lhs
           emitArmPush .x0
           emitArmExpr env rhs
           emitArmInstr (.mov_reg .x1 .x0)
           emitArmPop .x0
           emitArmInstr (.cmp_reg .x0 .x1)
-          emitArmInstr (.cset .x0 "ge")
+          emitArmInstr (.cset .x0 (if signed then "ge" else "hs"))
       | .and_ =>
           let falseLbl ← freshArmLabel "and_false"
           let endLbl ← freshArmLabel "and_end"
@@ -390,12 +436,15 @@ partial def emitArmExpr (env : TypeEnv) (expr : Expr) : ArmCodegenM Unit := do
           emitArmPop .x0
           emitArmInstr (.lsl_reg .x0 .x0 .x1)
       | .shr =>
+          let st ← get
+          let signed := isSignedTy (resolveType st.typedefs (inferExprType env st.structDefs lhs))
           emitArmExpr env lhs
           emitArmPush .x0
           emitArmExpr env rhs
           emitArmInstr (.mov_reg .x1 .x0)
           emitArmPop .x0
-          emitArmInstr (.asr_reg .x0 .x0 .x1)
+          if signed then emitArmInstr (.asr_reg .x0 .x0 .x1)
+          else emitArmInstr (.lsr_reg .x0 .x0 .x1)
       -- Compound assignment ops
       | .addAssign => emitArmCompoundAssign env lhs rhs .add
       | .subAssign => emitArmCompoundAssign env lhs rhs .sub
@@ -431,32 +480,40 @@ partial def emitArmExpr (env : TypeEnv) (expr : Expr) : ArmCodegenM Unit := do
           emitArmExpr env operand
           emitArmInstr (.mvn .x0 .x0)
       | .preInc =>
-          let _lhsTy ← emitArmLValueAddr env operand
+          let lhsTy ← emitArmLValueAddr env operand
+          let st ← get
+          let sz := cTypeSize st.structDefs lhsTy
           emitArmInstr (.mov_reg .x9 .x0)   -- x9 = addr
-          emitArmInstr (.ldr .x0 .x9 0)     -- x0 = old value
+          emitArmLoadWidth st.structDefs st.typedefs .x9 0 lhsTy  -- x0 = old value
           emitArmInstr (.add_imm .x0 .x0 1)
-          emitArmInstr (.str .x0 .x9 0)     -- store new value
+          emitArmStoreWidth .x0 .x9 0 sz     -- store new value
       | .preDec =>
-          let _lhsTy ← emitArmLValueAddr env operand
+          let lhsTy ← emitArmLValueAddr env operand
+          let st ← get
+          let sz := cTypeSize st.structDefs lhsTy
           emitArmInstr (.mov_reg .x9 .x0)
-          emitArmInstr (.ldr .x0 .x9 0)
+          emitArmLoadWidth st.structDefs st.typedefs .x9 0 lhsTy
           emitArmInstr (.sub_imm .x0 .x0 1)
-          emitArmInstr (.str .x0 .x9 0)
+          emitArmStoreWidth .x0 .x9 0 sz
       | .postInc =>
-          let _lhsTy ← emitArmLValueAddr env operand
+          let lhsTy ← emitArmLValueAddr env operand
+          let st ← get
+          let sz := cTypeSize st.structDefs lhsTy
           emitArmInstr (.mov_reg .x9 .x0)
-          emitArmInstr (.ldr .x0 .x9 0)
+          emitArmLoadWidth st.structDefs st.typedefs .x9 0 lhsTy
           emitArmInstr (.mov_reg .x10 .x0)  -- x10 = old value (return this)
           emitArmInstr (.add_imm .x0 .x0 1)
-          emitArmInstr (.str .x0 .x9 0)
+          emitArmStoreWidth .x0 .x9 0 sz
           emitArmInstr (.mov_reg .x0 .x10)  -- return old
       | .postDec =>
-          let _lhsTy ← emitArmLValueAddr env operand
+          let lhsTy ← emitArmLValueAddr env operand
+          let st ← get
+          let sz := cTypeSize st.structDefs lhsTy
           emitArmInstr (.mov_reg .x9 .x0)
-          emitArmInstr (.ldr .x0 .x9 0)
+          emitArmLoadWidth st.structDefs st.typedefs .x9 0 lhsTy
           emitArmInstr (.mov_reg .x10 .x0)
           emitArmInstr (.sub_imm .x0 .x0 1)
-          emitArmInstr (.str .x0 .x9 0)
+          emitArmStoreWidth .x0 .x9 0 sz
           emitArmInstr (.mov_reg .x0 .x10)
   | .index arr idx loc_ =>
       let _ ← emitArmLValueAddr env (.index arr idx loc_)
@@ -539,27 +596,41 @@ partial def emitArmCompoundAssign (env : TypeEnv) (lhs : Expr) (rhs : Expr) (op 
   emitArmExpr env rhs
   emitArmPush .x0               -- push rhs
   -- Get lvalue address
-  let _lhsTy ← emitArmLValueAddr env lhs
+  let lhsTy ← emitArmLValueAddr env lhs
+  let st ← get
+  let sz := cTypeSize st.structDefs lhsTy
+  let lty := resolveType st.typedefs lhsTy
+  let rty := resolveType st.typedefs (inferExprType env st.structDefs rhs)
+  let lSigned := isSignedTy lty
+  let signed := lSigned && isSignedTy rty
   emitArmInstr (.mov_reg .x9 .x0)   -- x9 = addr
-  emitArmInstr (.ldr .x0 .x9 0)     -- x0 = old value
+  emitArmLoadWidth st.structDefs st.typedefs .x9 0 lhsTy  -- x0 = old value
   emitArmPop .x1                     -- x1 = rhs
   -- Perform operation: x0 = x0 op x1
   match op with
   | .add => emitArmInstr (.add_reg .x0 .x0 .x1)
   | .sub => emitArmInstr (.sub_reg .x0 .x0 .x1)
   | .mul => emitArmInstr (.mul_reg .x0 .x0 .x1)
-  | .div => emitArmInstr (.sdiv .x0 .x0 .x1)
+  | .div => if signed then emitArmInstr (.sdiv .x0 .x0 .x1) else emitArmInstr (.udiv .x0 .x0 .x1)
   | .mod =>
-      emitArmInstr (.sdiv .x10 .x0 .x1)
+      if signed then emitArmInstr (.sdiv .x10 .x0 .x1) else emitArmInstr (.udiv .x10 .x0 .x1)
       emitArmInstr (.msub .x0 .x10 .x1 .x0)
   | .bitAnd => emitArmInstr (.and_reg .x0 .x0 .x1)
   | .bitOr => emitArmInstr (.orr_reg .x0 .x0 .x1)
   | .bitXor => emitArmInstr (.eor_reg .x0 .x0 .x1)
   | .shl => emitArmInstr (.lsl_reg .x0 .x0 .x1)
-  | .shr => emitArmInstr (.asr_reg .x0 .x0 .x1)
+  | .shr => if lSigned then emitArmInstr (.asr_reg .x0 .x0 .x1) else emitArmInstr (.lsr_reg .x0 .x0 .x1)
+  | _ => pure ()
+  -- Truncate add/sub/mul results back to the lhs width if it's a narrow (<=32-bit) int type
+  match op with
+  | .add | .sub | .mul =>
+      match narrowIntTruncKind st.structDefs lty rty with
+      | some true => emitArmInstr (.sxtw .x0 .x0)
+      | some false => emitArmInstr (.uxtw .x0 .x0)
+      | none => pure ()
   | _ => pure ()
   -- Store result back
-  emitArmInstr (.str .x0 .x9 0)
+  emitArmStoreWidth .x0 .x9 0 sz
 
 partial def emitArmCall (env : TypeEnv) (fn : String) (args : List Expr) : ArmCodegenM Unit := do
   if args.length > armArgRegs.length then

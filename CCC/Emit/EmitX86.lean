@@ -150,6 +150,48 @@ partial def resolveType (typedefs : List TypedefDecl) (ty : CType) : CType :=
   | .array inner n => .array (resolveType typedefs inner) n
   | _ => ty
 
+/-- Whether a C type is signed, for choosing signed vs unsigned comparison / division / shift
+    instruction forms. `pointer`, `array`, `size_t`, `bool`, and anything wrapped in `.unsigned`
+    are treated as unsigned; everything else (char/short/int/long/long long/enum/`.signed _`,
+    and const/volatile/restrict-qualified wrappers, recursively) is treated as signed — this
+    matches C's default `char`/`int` signedness on the Apple AArch64/x86-64 ABI. Callers should
+    `resolveType` the type first so `typedef_` chains are already resolved. -/
+partial def isSignedTy (ty : CType) : Bool :=
+  match ty with
+  | .unsigned _ => false
+  | .pointer _ => false
+  | .array _ _ => false
+  | .sizeT => false
+  | .bool => false
+  | .funcPtr _ _ => false
+  | .const_ inner => isSignedTy inner
+  | .volatile_ inner => isSignedTy inner
+  | .restrict_ inner => isSignedTy inner
+  | _ => true
+
+/-- Pointers and arrays always participate in 64-bit address arithmetic — never truncated to
+    32-bit `int` width. -/
+def isPointerLikeTy (ty : CType) : Bool :=
+  match ty with
+  | .pointer _ | .array _ _ => true
+  | _ => false
+
+/-- For an `add`/`sub`/`mul` whose (already `resolveType`-resolved) operand types are `lty`/`rty`:
+    `none` means the result should stay a full 64-bit value (either operand is pointer/array-typed,
+    or is a genuinely 64-bit-wide type such as `long`); `some signed` means the arithmetic was done
+    on values that represent C `int`-or-narrower operands, so the low 32 bits of the (64-bit
+    register) result must be truncated and then sign-extended (`signed = true`, when both operands
+    are signed) or zero-extended (`signed = false`) back to 64 bits, reproducing C's 32-bit
+    wraparound semantics for `int` arithmetic performed in 64-bit registers on operands that are
+    already correctly sign/zero-extended. -/
+def narrowIntTruncKind (structDefs : List StructDef) (lty rty : CType) : Option Bool :=
+  if isPointerLikeTy lty || isPointerLikeTy rty then
+    none
+  else if cTypeSize structDefs lty ≤ 4 && cTypeSize structDefs rty ≤ 4 then
+    some (isSignedTy lty && isSignedTy rty)
+  else
+    none
+
 partial def inferExprType (env : TypeEnv) (defs : List StructDef) (expr : Expr) : CType :=
   match expr with
   | .intLit _ _ => .long
