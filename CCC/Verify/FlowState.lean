@@ -37,13 +37,22 @@ structure FlowState where
   varTypes   : List (String × Syntax.CType)
   bounds     : List (String × IRange)
   aliases    : List (String × String)   -- (alias, origin) pointer alias pairs
+  -- Keys (same access-path scheme as `bounds`) known to be nonzero at this
+  -- point — a separate, coarser fact than an `IRange` (which can't cleanly
+  -- represent "any value except 0" when the surrounding range is otherwise
+  -- unconstrained). Used to prove a division/modulo divisor safe without
+  -- needing to know its sign or a tight bound — established by `x != 0`
+  -- (or the false branch of `x == 0`) on ANY integer key, not just
+  -- pointers (unlike `ptrStates`/`ptrNonNull`, which only track pointer
+  -- liveness).
+  nonZeroKeys : List String
   evidence   : List Syntax.SafetyEvidence
   violations : List Syntax.SafetyViolation
   deriving Inhabited
 
 namespace FlowState
 
-def empty : FlowState := ⟨[], [], [], [], [], []⟩
+def empty : FlowState := ⟨[], [], [], [], [], [], []⟩
 
 def getPtr (state : FlowState) (name : String) : Option Syntax.PtrState :=
   (state.ptrStates.find? (·.1 == name)).map (·.2)
@@ -90,6 +99,16 @@ def tightenHiExclusive (state : FlowState) (name : String) (v : Int) : FlowState
 def tightenLo (state : FlowState) (name : String) (v : Int) : FlowState :=
   let cur := (state.getRange name).getD IRange.unknown
   state.setRange name (cur.withLo v)
+
+def isNonZero (state : FlowState) (key : String) : Bool :=
+  state.nonZeroKeys.any (· == key)
+
+def setNonZero (state : FlowState) (key : String) : FlowState :=
+  if state.isNonZero key then state
+  else { state with nonZeroKeys := key :: state.nonZeroKeys }
+
+def clearNonZero (state : FlowState) (key : String) : FlowState :=
+  { state with nonZeroKeys := state.nonZeroKeys.filter (· != key) }
 
 def addViolation (state : FlowState) (v : Syntax.SafetyViolation) : FlowState :=
   { state with violations := state.violations ++ [v] }
@@ -202,10 +221,16 @@ def FlowState.merge (a b : FlowState) : FlowState :=
         else pair :: acc)
       []
 
+  -- Nonzero-ness is only kept when BOTH branches established it — same
+  -- soundness reasoning as `mergedBounds` above.
+  let mergedNonZero : List String :=
+    a.nonZeroKeys.filter (fun k => b.isNonZero k)
+
   { ptrStates := mergedPtrs
     varTypes := mergedTypes
     bounds := mergedBounds
     aliases := mergedAliases
+    nonZeroKeys := mergedNonZero
     evidence := a.evidence ++ b.evidence
     violations := a.violations ++ b.violations }
 

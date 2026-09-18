@@ -48,6 +48,42 @@ private def mkBufSinkViolation (ctx : VerifyCtx) (loc : Syntax.Loc) (expr : Synt
     context := [s!"function: {ctx.currentFun}", s!"builtin: {fnName}"]
     suggestion := some suggestion }
 
+private def mkDivByZeroViolation (ctx : VerifyCtx) (loc : Syntax.Loc) (expr : Syntax.Expr)
+    (opName : String) : Syntax.SafetyViolation :=
+  { property := .noDivByZero
+    loc := loc
+    expr := reprStr expr
+    message := s!"Cannot verify the {opName} divisor is nonzero"
+    context := [s!"function: {ctx.currentFun}"]
+    suggestion := some "Guard with an explicit `!= 0` check, or prove it via a literal/shift-of-nonzero divisor" }
+
+/-- Is `rhs` (a division/modulo divisor) provably nonzero? A literal
+    resolves directly; `1 << x`-shaped expressions (the extremely common
+    "compute a power-of-two mask/bucket-count" idiom, e.g. libwebp's
+    `sym % (1 << root_bits)`) are safe whenever the shifted base is a
+    nonzero literal; otherwise fall back to an explicit `!= 0` branch fact
+    (`FlowState.nonZeroKeys`) or a range that excludes zero entirely
+    (strictly positive or strictly negative). -/
+private def isProvablyNonzero (ctx : VerifyCtx) (state : FlowState) (rhs : Syntax.Expr) : Bool :=
+  match resolveExprInt ctx rhs with
+  | some v => v != 0
+  | none =>
+      match rhs with
+      | .binOp .shl base _shiftAmt _ =>
+          match resolveExprInt ctx base with
+          | some b => b != 0
+          | none => false
+      | _ =>
+          match boundKeyFromExpr? rhs with
+          | some key =>
+              state.isNonZero key ||
+              (match state.getRange key with
+                | some r =>
+                    (match r.lo with | some l => l > 0 | none => false) ||
+                    (match r.hi with | some h => h ≤ 0 | none => false)
+                | none => false)
+          | none => false
+
 partial def exprType? (ctx : VerifyCtx) (state : FlowState) (expr : Syntax.Expr)
     : Option Syntax.CType :=
   match expr with
@@ -308,14 +344,16 @@ private def applyScalarAssign (ctx : VerifyCtx) (lhs rhs : Syntax.Expr) (state :
   | none => state
   | some key =>
       match resolveExprInt ctx rhs with
-      | some v => state.setRange key (IRange.point v)
+      | some v =>
+          let s1 := state.setRange key (IRange.point v)
+          if v != 0 then s1.setNonZero key else s1.clearNonZero key
       | none =>
           match selfShiftDelta? ctx key rhs with
           | some d =>
               match state.getRange key with
-              | some r => state.setRange key (r.shift d)
-              | none => state.clearRange key
-          | none => state.clearRange key
+              | some r => (state.setRange key (r.shift d)).clearNonZero key
+              | none => (state.clearRange key).clearNonZero key
+          | none => (state.clearRange key).clearNonZero key
 
 private def applyScalarCompound (ctx : VerifyCtx) (op : Syntax.BinOp) (lhs rhs : Syntax.Expr)
     (state : FlowState) : FlowState :=
@@ -328,8 +366,8 @@ private def applyScalarCompound (ctx : VerifyCtx) (op : Syntax.BinOp) (lhs rhs :
         | .subAssign => (resolveExprInt ctx rhs).map (fun v => -v)
         | _ => none
       match delta?, state.getRange key with
-      | some d, some r => state.setRange key (r.shift d)
-      | _, _ => state.clearRange key
+      | some d, some r => (state.setRange key (r.shift d)).clearNonZero key
+      | _, _ => (state.clearRange key).clearNonZero key
 
 private def applyScalarIncDec (op : Syntax.UnOp) (operand : Syntax.Expr) (state : FlowState)
     : FlowState :=
@@ -342,8 +380,8 @@ private def applyScalarIncDec (op : Syntax.UnOp) (operand : Syntax.Expr) (state 
         | .preDec | .postDec => some (-1)
         | _ => none
       match delta?, state.getRange key with
-      | some d, some r => state.setRange key (r.shift d)
-      | some _, none => state.clearRange key
+      | some d, some r => (state.setRange key (r.shift d)).clearNonZero key
+      | some _, none => (state.clearRange key).clearNonZero key
       | none, _ => state
 
 /-- Called for a `varDecl` initializer: seeds a point range when the
@@ -352,7 +390,9 @@ private def applyScalarIncDec (op : Syntax.UnOp) (operand : Syntax.Expr) (state 
 def applyDeclRange (ctx : VerifyCtx) (name : String) (init : Syntax.Expr) (state : FlowState)
     : FlowState :=
   match resolveExprInt ctx init with
-  | some v => state.setRange name (IRange.point v)
+  | some v =>
+      let s1 := state.setRange name (IRange.point v)
+      if v != 0 then s1.setNonZero name else s1.clearNonZero name
   | none => state
 
 /-- Bounds checks over expressions (array index, memcpy-shaped sinks, and
@@ -360,13 +400,20 @@ def applyDeclRange (ctx : VerifyCtx) (name : String) (init : Syntax.Expr) (state
 partial def checkExpr (ctx : VerifyCtx) (expr : Syntax.Expr) (state : FlowState) : FlowState :=
   match expr with
   | .intLit _ _ | .charLit _ _ | .var _ _ | .sizeOf _ _ => state
-  | .binOp op lhs rhs _ =>
+  | .binOp op lhs rhs loc =>
       match op with
       | .addAssign | .subAssign | .mulAssign | .divAssign | .modAssign
       | .andAssign | .orAssign | .xorAssign | .shlAssign | .shrAssign =>
           let s1 := checkExpr ctx lhs state
           let s2 := checkExpr ctx rhs s1
           applyScalarCompound ctx op lhs rhs s2
+      | .div | .mod =>
+          let s1 := checkExpr ctx lhs state
+          let s2 := checkExpr ctx rhs s1
+          if isProvablyNonzero ctx s2 rhs then s2
+          else
+            s2.addViolation
+              (mkDivByZeroViolation ctx loc expr (if op == .div then "division" else "modulo"))
       | _ =>
           let s1 := checkExpr ctx lhs state
           checkExpr ctx rhs s1

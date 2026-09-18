@@ -60,6 +60,7 @@ def violationTag : SafetyProperty → String
   | .noDoubleFree    => "double-free"
   | .noNullDeref     => "null-deref"
   | .noStackOverflow => "stack-overflow"
+  | .noDivByZero     => "div-by-zero"
 
 open CCC.Syntax in
 /-- Format a single FunVerifyResult as one line of verify-report output. -/

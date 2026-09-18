@@ -68,6 +68,7 @@ inductive SafetyProperty where
   | noDoubleFree     -- CWE-415: free of already-freed pointer
   | noNullDeref      -- CWE-476: dereference of potentially-null pointer
   | noStackOverflow  -- CWE-121: stack buffer overflow
+  | noDivByZero      -- CWE-369: division or modulo by a value that may be zero
   deriving Repr, Inhabited, BEq, DecidableEq
 
 /-- A single safety violation found by the verifier. -/

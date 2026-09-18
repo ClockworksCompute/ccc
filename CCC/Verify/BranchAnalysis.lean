@@ -9,6 +9,7 @@ inductive BranchFact where
   | ptrIsNull (name : String)
   | rangeLo (key : String) (v : Int)           -- key ≥ v
   | rangeHiExclusive (key : String) (v : Int)  -- key < v
+  | nonZero (key : String)                     -- key ≠ 0 (any integer key, not just pointers)
   deriving Repr, Inhabited, BEq, DecidableEq
 
 private def fieldBoundKey (obj : String) (field : String) : String :=
@@ -94,6 +95,21 @@ private def extractNullEqFacts (lhs rhs : Syntax.Expr)
   | _, some p, _, true => ([.ptrIsNull p], [.ptrNonNull p])
   | _, _, _, _ => ([], [])
 
+/-- `key == 0` / `key != 0` on ANY integer key (not gated on being a
+    tracked pointer) — the divisor-safety fact a division check needs.
+    Kept separate from the pointer-null facts above: those only ever act
+    on tracked `PtrState`s, so emitting both is harmless (each is a no-op
+    where it doesn't apply) and correct where both do (e.g. `p == 0` for a
+    pointer `p` used elsewhere in integer-looking arithmetic). -/
+private def extractNonZeroFacts (lhs rhs : Syntax.Expr) (isEqOp : Bool)
+    : (List BranchFact) × (List BranchFact) :=
+  match rangeKeyOfExpr? lhs, intLitToInt? rhs with
+  | some key, some 0 => if isEqOp then ([], [.nonZero key]) else ([.nonZero key], [])
+  | _, _ =>
+      match intLitToInt? lhs, rangeKeyOfExpr? rhs with
+      | some 0, some key => if isEqOp then ([], [.nonZero key]) else ([.nonZero key], [])
+      | _, _ => ([], [])
+
 private def extractNullNeFacts (lhs rhs : Syntax.Expr)
     : (List BranchFact) × (List BranchFact) :=
   let lhsPtr : Option String := ptrNameFromExpr? lhs
@@ -109,8 +125,14 @@ partial def extractFacts (cond : Syntax.Expr) : (List BranchFact) × (List Branc
   | .unOp .not_ inner _ =>
       let (thenFacts, elseFacts) := extractFacts inner
       (elseFacts, thenFacts)
-  | .binOp .eq lhs rhs _ => extractNullEqFacts lhs rhs
-  | .binOp .ne lhs rhs _ => extractNullNeFacts lhs rhs
+  | .binOp .eq lhs rhs _ =>
+      let (t1, e1) := extractNullEqFacts lhs rhs
+      let (t2, e2) := extractNonZeroFacts lhs rhs true
+      (t1 ++ t2, e1 ++ e2)
+  | .binOp .ne lhs rhs _ =>
+      let (t1, e1) := extractNullNeFacts lhs rhs
+      let (t2, e2) := extractNonZeroFacts lhs rhs false
+      (t1 ++ t2, e1 ++ e2)
   | .binOp .lt lhs rhs _ => extractCmpFacts .lt lhs rhs
   | .binOp .gt lhs rhs _ => extractCmpFacts .gt lhs rhs
   | .binOp .le lhs rhs _ => extractCmpFacts .le lhs rhs
@@ -144,7 +166,8 @@ def applyFacts (facts : List BranchFact) (state : FlowState) : FlowState :=
           | some ps => st.setPtr name (.nullable (Syntax.PtrState.knownSize ps))
           | none => st
       | .rangeLo key v => st.tightenLo key v
-      | .rangeHiExclusive key v => st.tightenHiExclusive key v)
+      | .rangeHiExclusive key v => st.tightenHiExclusive key v
+      | .nonZero key => st.setNonZero key)
     state
 
 /-- Utility for callers that key bounds by `obj->field`. -/

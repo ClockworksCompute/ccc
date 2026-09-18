@@ -26,6 +26,7 @@ def propertyLabel : SafetyProperty → String
   | .noDoubleFree    => "Double free"
   | .noNullDeref     => "Null pointer dereference"
   | .noStackOverflow => "Stack buffer overflow"
+  | .noDivByZero     => "Division by a possibly-zero value"
 
 /-- Format a single violation with source context. -/
 def formatViolation (v : SafetyViolation) (source : String) : String :=

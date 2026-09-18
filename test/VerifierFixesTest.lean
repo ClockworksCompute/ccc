@@ -218,6 +218,44 @@ def main : IO UInt32 := do
      "  }\n  return 0;\n}")
   then pass := pass + 1
 
+  -- FEL-56 (div-by-zero, a tractable slice of the integer-overflow domain):
+  -- an unguarded division by a computed value that could be zero.
+  total := total + 1
+  if ← expectCaught "FEL56_div_by_unguarded_value"
+    ("int main(int w, int c) {\n" ++
+     "  int row_factor = w * c + 1;\n" ++
+     "  int x = 100 / row_factor;\n" ++
+     "  return x;\n}")
+  then pass := pass + 1
+
+  -- Regression guard: an explicit `!= 0` guard (the classic Euclidean-GCD
+  -- shape) must not be flagged.
+  total := total + 1
+  if ← expectClean "FEL56_div_guarded_by_nonzero_check_no_false_positive"
+    ("int gcd(int a, int b) {\n" ++
+     "  while (b != 0) {\n" ++
+     "    int t = b;\n" ++
+     "    b = a % b;\n" ++
+     "    a = t;\n" ++
+     "  }\n  return a;\n}\n" ++
+     "int main() { return gcd(252, 105); }")
+  then pass := pass + 1
+
+  -- Regression guard: `x % (1 << k)` (compute a power-of-two bucket
+  -- count/mask — extremely common, e.g. libwebp's Huffman table code)
+  -- must not be flagged just because `k` itself is unconstrained.
+  total := total + 1
+  if ← expectClean "FEL56_mod_by_shift_of_nonzero_no_false_positive"
+    "int main(int sym, int root_bits) {\n  int slot = sym % (1 << root_bits);\n  return slot;\n}"
+  then pass := pass + 1
+
+  -- Regression guard: a literal nonzero divisor (the overwhelming common
+  -- case in real code) must never be flagged.
+  total := total + 1
+  if ← expectClean "FEL56_div_by_literal_no_false_positive"
+    "int main() { int x = 10; return x / 3; }"
+  then pass := pass + 1
+
   IO.println s!"\n═══ Results: {pass}/{total} passed ═══"
   if pass == total then
     IO.println "All verifier-fixes regression tests passed!"
