@@ -1,0 +1,93 @@
+# CI for CCC — Clockworks C Compiler.
+#
+# Runs on every push/PR: builds the compiler, runs the full Lean test
+# suite (unit + integration + regression), and runs the CVE regression
+# corpus scoreboard (FEL-61) so its detection numbers are tracked in CI
+# history rather than only in a manually-updated docs/corpus-results.md
+# snapshot (part of the FEL-54 epic's Definition of Done: "the CVE corpus
+# scoreboard is in CI").
+#
+# The corpus scoreboard (scripts/corpus.sh) is a MEASUREMENT, not a gate —
+# it always exits 0 by design (see that script's own header comment), so
+# this job uploads its output as a build artifact and prints it in the
+# job summary rather than failing the build on a bad number. The verifier
+# is expected to improve incrementally (see FEL-56/57/58), and a corpus
+# entry moving from `missed`/`false-positive` towards `detected` should be
+# visible in the CI logs over time without every intermediate commit
+# needing to pass a hard threshold.
+name: CI
+
+on:
+  push:
+    branches: [main, "epic/**"]
+  pull_request:
+    branches: [main]
+  workflow_dispatch: {}
+
+jobs:
+  build-and-test:
+    # CCC targets Apple Silicon (Mach-O/AArch64) as its primary backend —
+    # see README.md's "Backend" section — so this runs on a macOS ARM64
+    # runner, matching every contributor's actual dev environment rather
+    # than cross-compiling or emulating.
+    runs-on: macos-14
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install elan (Lean toolchain manager)
+        run: |
+          curl https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh -sSf | sh -s -- -y --default-toolchain none
+          echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
+
+      - name: Cache Lake build
+        uses: actions/cache@v4
+        with:
+          path: .lake
+          key: lake-${{ runner.os }}-${{ hashFiles('lean-toolchain', 'lakefile.lean', 'lake-manifest.json') }}-${{ github.sha }}
+          restore-keys: |
+            lake-${{ runner.os }}-${{ hashFiles('lean-toolchain', 'lakefile.lean', 'lake-manifest.json') }}-
+
+      - name: Build ccc
+        run: lake build ccc
+
+      - name: Run test suites
+        run: |
+          set -uo pipefail
+          FAIL=0
+          for t in AArch64Test IntegrationTest HardeningTest Phase2Features \
+                   PreprocessTest TypedefTest VerifierAccuracyTest E2EAllDemos \
+                   VerifyAllDemos ParseAllDemos PreprocessElifTest EmitAndRun \
+                   MacroTest MacroTest2 MacroTest3 SignednessTest \
+                   VerifierFixesTest HardenTest; do
+            echo "::group::$t"
+            if ! lake env lean --run "test/$t.lean"; then
+              echo "::error::$t FAILED"
+              FAIL=1
+            fi
+            echo "::endgroup::"
+          done
+          exit $FAIL
+
+      - name: Run regression repros
+        run: bash test/regression/run_regressions.sh
+
+      - name: Run demo gate script
+        run: bash test/run_demos.sh
+
+      - name: Run CVE corpus scoreboard (FEL-61)
+        run: |
+          bash scripts/corpus.sh | tee corpus-scoreboard.txt
+          {
+            echo "## CVE corpus scoreboard (FEL-61)"
+            echo '```'
+            cat corpus-scoreboard.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload corpus scoreboard artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: corpus-scoreboard
+          path: corpus-scoreboard.txt

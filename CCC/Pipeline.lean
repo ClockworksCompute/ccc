@@ -66,7 +66,8 @@ def compile (source : String) (filename : String) : CompileResult :=
     verifier could not prove — NOT to silently hand back the unverified
     assembly as if nothing were wrong. Nothing calls this today; `Main.lean`
     only ever calls `compile`. -/
-def compileIgnoringViolations (source : String) (filename : String) : CompileResult :=
+def compileIgnoringViolations (source : String) (filename : String)
+    (harden : Bool := false) : CompileResult :=
   match parseSource source with
   | .error parseErr =>
     { assembly := none, verifyResult := none, violations := []
@@ -74,7 +75,7 @@ def compileIgnoringViolations (source : String) (filename : String) : CompileRes
   | .ok prog =>
     match verifyProgram prog with
     | .ok vprog =>
-      match emitProgram vprog with
+      match emitProgram vprog .aarch64 harden with
       | .ok asm =>
         { assembly := some asm, verifyResult := some vprog.evidence, violations := []
           report := Error.formatSuccess vprog.evidence filename .verified }
@@ -83,7 +84,7 @@ def compileIgnoringViolations (source : String) (filename : String) : CompileRes
           report := s!"ERROR: Emission error in {filename}:\n  {emitErr}" }
     | .error violations =>
       let verifyResult := violationsToResult violations
-      match Emit.emitProgramAArch64 prog with
+      match Emit.emitProgramAArch64 prog harden with
       | .ok asm =>
         { assembly := some asm, verifyResult := some verifyResult, violations := violations
           report := Error.formatResult verifyResult source filename }

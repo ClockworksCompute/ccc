@@ -148,6 +148,19 @@ partial def resolveType (typedefs : List TypedefDecl) (ty : CType) : CType :=
       | none => ty  -- unresolved, keep as-is
   | .pointer inner => .pointer (resolveType typedefs inner)
   | .array inner n => .array (resolveType typedefs inner) n
+  -- Qualifiers are layout-transparent for codegen purposes (nothing here
+  -- enforces const-correctness) and must not block typedef resolution:
+  -- `const uint8_t *` parses as `.pointer (.const_ (.typedef_ "uint8_t"))`,
+  -- and without unwrapping the qualifier first, `.typedef_ "uint8_t"`
+  -- never gets resolved to `.unsigned .char` — `cTypeSize` then falls back
+  -- to its unresolved-typedef default of 8 bytes instead of 1, silently
+  -- corrupting the stride of every indexed/dereferenced access through a
+  -- const-qualified typedef'd pointer (e.g. `const uint8_t *`, `const
+  -- char *` — extremely common in real C). Found via --harden runtime
+  -- checks firing on the libheif corpus's `const uint8_t *in_p` parameter.
+  | .const_ inner => resolveType typedefs inner
+  | .volatile_ inner => resolveType typedefs inner
+  | .restrict_ inner => resolveType typedefs inner
   | _ => ty
 
 /-- Whether a C type is signed, for choosing signed vs unsigned comparison / division / shift
@@ -268,7 +281,7 @@ partial def emitLValueAddr (env : TypeEnv) (expr : Expr) : CodegenM CType := do
   | .unOp .deref operand _ =>
       emitExpr env operand
       let st <- get
-      let ty := inferExprType env st.structDefs operand
+      let ty := resolveType st.typedefs (inferExprType env st.structDefs operand)
       match ty with
       | .pointer elem => pure elem
       | _ => pure .long
@@ -279,11 +292,11 @@ partial def emitLValueAddr (env : TypeEnv) (expr : Expr) : CodegenM CType := do
       emitInstr (.mov (.reg .rax) (.reg .rcx))
       emitInstr (.pop (.reg .rax))
       let st <- get
-      let arrTy := inferExprType env st.structDefs arr
-      let elemTy := match arrTy with
+      let arrTy := resolveType st.typedefs (inferExprType env st.structDefs arr)
+      let elemTy := resolveType st.typedefs (match arrTy with
         | .pointer elem => elem
         | .array elem _ => elem
-        | _ => .long
+        | _ => .long)
       let elemSize := cTypeSize st.structDefs elemTy
       if elemSize = 1 then
         emitInstr (.lea (.memIdx .rax .rcx 1 0) (.reg .rax))
@@ -627,7 +640,7 @@ partial def emitExpr (env : TypeEnv) (expr : Expr) : CodegenM Unit := do
       | .deref =>
           emitExpr env operand
           let st <- get
-          let ptrTy := inferExprType env st.structDefs operand
+          let ptrTy := resolveType st.typedefs (inferExprType env st.structDefs operand)
           let valTy := match ptrTy with
             | .pointer elem => elem
             | _ => .long
@@ -697,7 +710,7 @@ partial def emitExpr (env : TypeEnv) (expr : Expr) : CodegenM Unit := do
   | .index arr idx loc =>
       let _ <- emitLValueAddr env (.index arr idx loc)
       let st <- get
-      let valTy := inferExprType env st.structDefs (.index arr idx loc)
+      let valTy := resolveType st.typedefs (inferExprType env st.structDefs (.index arr idx loc))
       emitLoadFromAddr valTy
   | .member obj field loc =>
       let _ <- emitLValueAddr env (.member obj field loc)

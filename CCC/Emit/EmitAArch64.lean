@@ -40,6 +40,13 @@ structure ArmCodegenState where
   instrs       : List ArmInstr
   dataSection  : List String
   loopStack    : List LoopCtx
+  -- FEL-59 (--harden, prototype): when true, every `.index` access through
+  -- a POINTER-typed base (not a local `.array _ n`, whose size is already
+  -- known at compile time) gets a runtime bounds check against the
+  -- allocation-size registry in `runtime/ccc_runtime.c` before the access.
+  -- Defaults to false everywhere except the explicit --harden path, so
+  -- ordinary compilation is byte-for-byte unchanged.
+  harden       : Bool := false
 
 abbrev ArmCodegenM := StateT ArmCodegenState (Except String)
 
@@ -156,7 +163,7 @@ partial def emitArmLValueAddr (env : TypeEnv) (expr : Expr) : ArmCodegenM CType 
   | .unOp .deref operand _ =>
       emitArmExpr env operand
       let st ← get
-      let ty := inferExprType env st.structDefs operand
+      let ty := resolveType st.typedefs (inferExprType env st.structDefs operand)
       match ty with
       | .pointer elem => pure elem
       | _ => pure .long
@@ -167,12 +174,30 @@ partial def emitArmLValueAddr (env : TypeEnv) (expr : Expr) : ArmCodegenM CType 
       emitArmInstr (.mov_reg .x1 .x0)
       emitArmPop .x0
       let st ← get
-      let arrTy := inferExprType env st.structDefs arr
-      let elemTy := match arrTy with
+      let arrTy := resolveType st.typedefs (inferExprType env st.structDefs arr)
+      let elemTy := resolveType st.typedefs (match arrTy with
         | .pointer elem => elem
         | .array elem _ => elem
-        | _ => .long
+        | _ => .long)
       let elemSize := cTypeSize st.structDefs elemTy
+      -- FEL-59 (--harden, prototype): x0=base, x1=index at this point.
+      -- A POINTER-typed base (heap allocation or parameter — anything
+      -- whose real size isn't visible at compile time) gets a runtime
+      -- check; a local `.array _ n` is left alone (its size is already
+      -- known here, and the static verifier already checks what it can
+      -- for those). Saves/restores x0/x1 across the call since `bl`
+      -- clobbers caller-saved registers.
+      if st.harden then
+        match arrTy with
+        | .pointer _ =>
+            emitArmPush .x0
+            emitArmPush .x1
+            emitArmInstr (.mov_imm .x2 (Int.ofNat elemSize))
+            emitArmInstr (.bl "ccc_check_index")
+            emitArmPop .x1
+            emitArmPop .x0
+        | _ => pure ()
+      else pure ()
       -- x0 = base, x1 = index; compute x0 = x0 + x1 * elemSize
       if elemSize = 1 then
         emitArmInstr (.add_reg .x0 .x0 .x1)
@@ -468,7 +493,7 @@ partial def emitArmExpr (env : TypeEnv) (expr : Expr) : ArmCodegenM Unit := do
       | .deref =>
           emitArmExpr env operand
           let st ← get
-          let ptrTy := inferExprType env st.structDefs operand
+          let ptrTy := resolveType st.typedefs (inferExprType env st.structDefs operand)
           let valTy := match ptrTy with
             | .pointer elem => elem
             | _ => .long
@@ -518,7 +543,7 @@ partial def emitArmExpr (env : TypeEnv) (expr : Expr) : ArmCodegenM Unit := do
   | .index arr idx loc_ =>
       let _ ← emitArmLValueAddr env (.index arr idx loc_)
       let st ← get
-      let valTy := inferExprType env st.structDefs (.index arr idx loc_)
+      let valTy := resolveType st.typedefs (inferExprType env st.structDefs (.index arr idx loc_))
       emitArmLoadFromAddr valTy
   | .member obj field loc_ =>
       let _ ← emitArmLValueAddr env (.member obj field loc_)
@@ -813,7 +838,7 @@ def emitArmParamMoves (params : List Param) (offsets : List (String × Int)) : A
         emitArmInstr (.str reg .x29 off)
 
 def emitArmFunction (structDefs : List StructDef) (typedefs : List TypedefDecl)
-    (globalNames : List (String × CType)) (fn : FunDef)
+    (globalNames : List (String × CType)) (fn : FunDef) (harden : Bool := false)
     : Except String (List ArmInstr × List String) := do
   let paramBindings : TypeEnv := fn.params.map (fun (p : Param) => (p.name, p.ty))
   let localBindings : TypeEnv := collectVarDecls fn.body
@@ -834,6 +859,7 @@ def emitArmFunction (structDefs : List StructDef) (typedefs : List TypedefDecl)
     instrs := []
     dataSection := []
     loopStack := []
+    harden := harden
   }
   let env : TypeEnv := allBindings
   let retLabel : ArmLabel := { fn := fn.name, kind := "ret", idx := 0 }
@@ -865,12 +891,13 @@ def renderArmFunction (name : String) (instrs : List ArmInstr) : List String :=
   [s!".globl _{name}", s!".p2align 2", s!"_{name}:"] ++ instrs.map ArmInstr.render
 
 /-- Emit an entire program as AArch64 assembly -/
-def emitProgramAArch64 (prog : CCC.Syntax.Program) : Except String String := do
+def emitProgramAArch64 (prog : CCC.Syntax.Program) (harden : Bool := false)
+    : Except String String := do
   let globalNames : List (String × CType) := prog.globals.map (fun g => (g.name, g.ty))
   let mut allInstrs : List String := []
   let mut allData : List String := []
   for fn in prog.functions do
-    let (instrs, dataLines) ← emitArmFunction prog.structs prog.typedefs globalNames fn
+    let (instrs, dataLines) ← emitArmFunction prog.structs prog.typedefs globalNames fn harden
     allInstrs := allInstrs ++ renderArmFunction fn.name instrs
     allData := allData ++ dataLines
   -- Emit global variable storage

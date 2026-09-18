@@ -57,9 +57,10 @@ def detectArch : TargetArch :=
   -- This is a runtime default; CLI flag can override later
   .aarch64  -- Apple Silicon is our primary dev platform
 
-def emitProgram (vprog : VerifiedProgram) (arch : TargetArch := detectArch) : Except String String :=
+def emitProgram (vprog : VerifiedProgram) (arch : TargetArch := detectArch)
+    (harden : Bool := false) : Except String String :=
   match arch with
-  | .aarch64 => Emit.emitProgramAArch64 vprog.program
+  | .aarch64 => Emit.emitProgramAArch64 vprog.program harden
   | .x86_64  => Emit.emitProgramImpl vprog.program
 
 end CCC

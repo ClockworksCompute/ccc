@@ -19,11 +19,16 @@ def usage : String :=
   "  --harden: EXPERIMENTAL (FEL-59, in progress). Emit a binary even when\n" ++
   "    the verifier finds violations it cannot clear, with a loud warning\n" ++
   "    naming exactly what was not proven. Exit code stays 0. As of this\n" ++
-  "    build this ONLY suppresses the normal reject-and-exit-1 behavior —\n" ++
-  "    it does NOT yet insert runtime bounds/null/UAF checks at the\n" ++
-  "    unproven accesses (that instrumentation is the rest of FEL-59, not\n" ++
-  "    implemented yet). Never use this on untrusted input expecting real\n" ++
-  "    protection; it is a development aid today, not a hardening mode.\n" ++
+  "    build, every array/pointer subscript through a pointer-typed base\n" ++
+  "    (a heap allocation or a parameter — anything whose size isn't known\n" ++
+  "    at compile time) gets a REAL runtime bounds check against a size\n" ++
+  "    registry populated by ccc_malloc, and aborts instead of corrupting\n" ++
+  "    memory on an out-of-bounds or negative index. NOT yet covered:\n" ++
+  "    struct field arrow/dot access, bare pointer dereference (`*p`), and\n" ++
+  "    any allocation the registry didn't see (a full table, or a pointer\n" ++
+  "    from something other than malloc/calloc). Those stay exactly as\n" ++
+  "    unprotected as without --harden. Do not treat this as a complete\n" ++
+  "    hardening mode yet.\n" ++
   "  If no -o specified, only verify (no assembly/linking)."
 
 /-- Find the runtime source file relative to the executable. -/
@@ -124,7 +129,7 @@ def main (args : List String) : IO UInt32 := do
   -- Compile. `--harden` uses the explicit force-emit escape hatch instead
   -- of the safe default (see FEL-40/FEL-59) and prints a loud disclaimer
   -- whenever it actually needed to.
-  let result := if harden then CCC.compileIgnoringViolations source filename
+  let result := if harden then CCC.compileIgnoringViolations source filename harden
                 else CCC.compile source filename
 
   -- Print report
