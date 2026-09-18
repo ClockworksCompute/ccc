@@ -130,24 +130,26 @@ def main : IO UInt32 := do
         IO.eprintln s!"✗ T3_printf_force: no assembly produced (force-emit failed)"
 
   -- ═══════════════════════════════════════════
-  -- T4: malloc + struct arrow via force-emit
+  -- T4: malloc + struct arrow, genuinely verified (FEL-40: force-emit is
+  -- gone, so this must be null-checked to get assembly at all — it used
+  -- to rely on force-emit to paper over the missing check).
   -- ═══════════════════════════════════════════
   total := total + 1
   do
-    let src := "struct Node { int val; int pad; };\nint main() {\n    struct Node *n = malloc(16);\n    n->val = 42;\n    int r = n->val;\n    free(n);\n    return r;\n}"
+    let src := "struct Node { int val; int pad; };\nint main() {\n    struct Node *n = malloc(16);\n    if (n == 0) { return -1; }\n    n->val = 42;\n    int r = n->val;\n    free(n);\n    return r;\n}"
     let (asmOpt, nViolations) ← compileViaPipeline src
     match asmOpt with
     | some asm =>
         try
-          let exitCode ← assembleAndRun asm "T4_malloc_force" (withRuntime := true)
+          let exitCode ← assembleAndRun asm "T4_malloc_verified" (withRuntime := true)
           if exitCode == 42 then
-            IO.println s!"✓ T4_malloc_force: exit code {exitCode} (expected 42), violations={nViolations} (force-emit OK)"
+            IO.println s!"✓ T4_malloc_verified: exit code {exitCode} (expected 42), violations={nViolations} (verified, no force-emit needed)"
             pass := pass + 1
           else
-            IO.eprintln s!"✗ T4_malloc_force: exit code {exitCode}, expected 42"
-        catch e => IO.eprintln s!"✗ T4_malloc_force: {e}"
+            IO.eprintln s!"✗ T4_malloc_verified: exit code {exitCode}, expected 42"
+        catch e => IO.eprintln s!"✗ T4_malloc_verified: {e}"
     | none =>
-        IO.eprintln s!"✗ T4_malloc_force: no assembly produced (force-emit failed)"
+        IO.eprintln s!"✗ T4_malloc_verified: no assembly produced ({nViolations} violation(s)) — should be 0"
 
   -- ═══════════════════════════════════════════
   -- T5: String literal + puts
@@ -188,19 +190,26 @@ def main : IO UInt32 := do
         catch e => IO.eprintln s!"✗ T6_bss_global: {e}"
 
   -- ═══════════════════════════════════════════
-  -- T7: Force-emit produces assembly despite violations
+  -- T7: FEL-40 regression guard — a program with a genuine null-deref
+  -- violation must produce NO assembly at all (force-emit removed). This
+  -- test used to assert the opposite (that force-emit papered over the
+  -- violation); it now asserts the fix directly.
   -- ═══════════════════════════════════════════
   total := total + 1
   do
-    -- This program triggers null-deref warnings from the verifier
+    -- This program has an unchecked null-deref: `p` is never compared
+    -- against 0 before `*p = 7;`.
     let src := "int main() { int *p = malloc(8); *p = 7; int r = *p; free(p); return r; }"
     let (asmOpt, nViolations) ← compileViaPipeline src
     match asmOpt with
-    | some _ =>
-        IO.println s!"✓ T7_force_emit_check: assembly produced with {nViolations} violation(s) (force-emit OK)"
-        pass := pass + 1
     | none =>
-        IO.eprintln s!"✗ T7_force_emit_check: no assembly produced (force-emit failed)"
+        if nViolations ≥ 1 then
+          IO.println s!"✓ T7_no_force_emit: correctly produced NO assembly ({nViolations} violation(s) found, FEL-40 fix holds)"
+          pass := pass + 1
+        else
+          IO.eprintln s!"✗ T7_no_force_emit: no assembly, but 0 violations reported — should have found the null-deref"
+    | some _ =>
+        IO.eprintln s!"✗ T7_no_force_emit: assembly was produced for a program with a real null-deref bug — force-emit regression!"
 
   -- ═══════════════════════════════════════════
   -- T8: Multiple globals
