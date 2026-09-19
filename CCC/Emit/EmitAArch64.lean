@@ -1036,6 +1036,43 @@ def emitProgramAArch64 (prog : CCC.Syntax.Program) (harden : Bool := false)
         -- Uninitialized → BSS
         globalBssLines := globalBssLines ++ [s!".globl _{g.name}",
           s!".zerofill __DATA,__bss,_{g.name},{sz},{alignPow}"]
+    | some (.initList elems _) =>
+        -- FEL-68: a global ARRAY's brace initializer (`int tbl[8] = {1,2,3};`)
+        -- — previously the parser didn't even register a global array's
+        -- SYMBOL at all (`static const int tbl[8] = {...}` vanished from
+        -- the program entirely, worse than merely losing its values), and
+        -- when it did register one, the initializer was parsed and
+        -- discarded, so it fell to the `none` branch above and came out
+        -- all-zero. Real C libraries lean heavily on this exact pattern
+        -- for lookup/CRC/coefficient tables. Each element is emitted with
+        -- the directive matching the ARRAY'S ELEMENT type's size (not the
+        -- whole array's), matching real ABI layout; C zero-pads any
+        -- trailing elements the initializer list didn't provide.
+        let elemTy := match g.ty with
+          | .array e _ => e
+          | _ => g.ty
+        let elemSz := max 1 (cTypeSize prog.structs elemTy)
+        let elemAlignPow := if elemSz ≥ 8 then 3 else if elemSz ≥ 4 then 2 else if elemSz ≥ 2 then 1 else 0
+        let count := match g.ty with
+          | .array _ n => n
+          | _ => elems.length
+        let directiveFor (v : Int) : String :=
+          if elemSz ≤ 1 then s!"    .byte {v}"
+          else if elemSz ≤ 2 then s!"    .short {v}"
+          else if elemSz ≤ 4 then s!"    .long {v}"
+          else s!"    .quad {v}"
+        let valueOf (e : Expr) : Int :=
+          match e with
+          | .intLit n _ => n
+          | .charLit c _ => Int.ofNat c.toNat
+          | _ => 0
+        globalDataLines := globalDataLines ++
+          [s!".globl _{g.name}", s!".p2align {elemAlignPow}", s!"_{g.name}:"]
+        for i in List.range count do
+          let v := match elems[i]? with
+            | some e => valueOf e
+            | none => 0
+          globalDataLines := globalDataLines ++ [directiveFor v]
     | some initExpr =>
         -- Initialized → DATA
         let val := match initExpr with

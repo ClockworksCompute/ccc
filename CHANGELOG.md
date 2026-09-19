@@ -13,9 +13,12 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - Calls with more than 8 arguments (and function DEFINITIONS with more than 8 parameters) used to throw "too many arguments" at the call site, and — separately and more seriously — silently drop the 9th+ parameter's spill code entirely at the definition site, leaving its local variable slot as uninitialized stack garbage. Implemented AAPCS64's stack-argument passing for both directions. Getting this conformant to the REAL ABI (as opposed to merely self-consistent) needed two rounds, both driven by tests that link CCC-compiled code against real `cc`-compiled code rather than only against itself: Apple's arm64 ABI packs each stack argument at its own natural size (not padded to a uniform 8 bytes, unlike the base AAPCS64 spec), and stack-argument sizing must come from the callee's *declared* parameter type when a prototype is visible, not from the caller expression's inferred type (a bare integer literal infers as `.long` elsewhere in this codebase, which is harmless for register-passed arguments but wrong for packing).
 
+- A top-level `int table[8];` (with or without a brace initializer) used to vanish from the compiled program entirely — the parser branch for global array declarations never registered the symbol at all, not merely its initial values. Real C code (lookup tables, CRC tables, coefficient tables) relies on this pattern heavily. Now registers a real `.array` global with its actual size, and a brace initializer's element values are kept and emitted to a proper `.data` section, width-correct per element type (`char`=1 byte, `short`=2, `int`=4, `long`=8) with C's zero-padding rule for elements the initializer list doesn't provide. Cross-checked directly against `cc` compiling the identical source.
+
 ### Added
 - `test/StructLayoutTest.lean` (10 cases) for the struct-alignment and `sizeof(expr)` fixes above.
 - `test/StackArgsTest.lean` (6 cases) for the stack-argument fix, including three that link CCC-compiled code against real `cc` output on one side of the call.
+- `test/GlobalArrayTest.lean` (7 cases) for the global array fix, including one cross-checked directly against `cc`.
 
 ## [0.2.0] - 2026-09-19
 

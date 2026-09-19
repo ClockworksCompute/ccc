@@ -1171,22 +1171,47 @@ partial def parseFunDefOrProto : Parser (Option FunDef) := do
       } :: st.pendingGlobals }
     pure none
   else if tok.kind == .lbracket then
-    -- Global array: `type name[size]` optionally followed by `= { ... };` or `;`
-    let _ ← advance
-    -- Skip to `]` — consume the array dimension expression
-    skipBracketContent 1
+    -- FEL-68: global array `type name[size]` optionally followed by
+    -- `= { ... };` or `;`. This branch previously never touched
+    -- `pendingGlobals` AT ALL — a top-level `int table[8];` (with or
+    -- without an initializer) vanished from the program entirely, not
+    -- merely losing its initial values. `parseArraySuffix` (already used
+    -- for locals/params/struct fields) gives a real `.array elem n`
+    -- type instead of the size being skipped and discarded; a brace
+    -- initializer's actual element VALUES are now kept via
+    -- `parseInitListElems` (as `Expr.initList`, the same node a local
+    -- array initializer already uses) instead of being parsed and
+    -- thrown away.
+    let arrTy ← parseArraySuffix retTy
     let tok2 ← currentToken
     if tok2.kind == .assign then
       let _ ← advance
       let initTok ← currentToken
       if initTok.kind == .lbrace then
         let _ ← advance
-        skipBraceContent 1
+        let elems ← parseInitListElems []
+        let _ ← expectKind .rbrace "'}' in global array initializer"
         let _ ← expectKind .semi "';'"
+        modify fun st => { st with pendingGlobals := {
+          name := name, ty := arrTy, init := some (.initList elems initTok.loc),
+          isExtern := false, isStatic := false, loc := startTok.loc
+        } :: st.pendingGlobals }
       else
+        -- A non-brace array initializer (e.g. `char msg[] = "hi";`, a
+        -- string literal) isn't captured as a real initializer yet —
+        -- register the SYMBOL with the right size (so it isn't dropped,
+        -- the more severe half of this bug) and skip past the value.
         let _ ← skipToSemicolon
+        modify fun st => { st with pendingGlobals := {
+          name := name, ty := arrTy, init := none,
+          isExtern := false, isStatic := false, loc := startTok.loc
+        } :: st.pendingGlobals }
     else
       let _ ← expectKind .semi "';'"
+      modify fun st => { st with pendingGlobals := {
+        name := name, ty := arrTy, init := none,
+        isExtern := false, isStatic := false, loc := startTok.loc
+      } :: st.pendingGlobals }
     pure none
   else
     -- Try as function definition anyway
