@@ -22,6 +22,22 @@ finding belongs to, so it cannot auto-file into a specific must-reject/
 directory the way the mutation fuzzer does; it writes the failing
 source to a local scratch file instead and prints the path).
 
+FEL-69 item 3 ("emitter differential ... extends SignednessTest to
+random programs, this is how the FEL-50 class of bugs is found
+automatically"): for every instance in the well-defined-behavior "ok"
+bucket (ccc accepts it AND the sanitizer run completed without a
+crash — i.e. a program where comparing exact runtime behavior is
+actually meaningful, unlike an "unsound"/overflow instance whose
+behavior is UB and where CCC's and cc's outputs are both equally
+"correct" nonsense), this ALSO compiles the same source with `ccc
+... -o` (the real emitter, not just the verifier) and runs the
+resulting binary, comparing its exit code against the already-executed
+sanitizer binary's exit code. A mismatch means CCC's emitter computed
+a different answer than a real C compiler for an accepted, well-defined
+program — a correctness bug, not a soundness one, but exactly the
+class FEL-50 (signed sub-word loads always zero-extended) was in
+before it was found by hand.
+
 Run with a fixed instance count (default) or `--duration-secs N` for a
 sustained run (FEL-69's own design calls for a nightly multi-hour run
 and an eventual 24h clean run — this flag is what makes that possible;
@@ -179,6 +195,30 @@ int main() {{
 TEMPLATES = [tmpl_local_array, tmpl_heap_array, tmpl_struct_field_array, tmpl_copy_loop]
 
 
+def emitter_diff(src_path: Path, tmp_dir: Path, idx: int, ref_exit: int):
+    """FEL-69 item 3: compile the same (already-accepted, well-defined)
+    source with ccc's real emitter (not just --report=json) and compare
+    its exit code against `ref_exit` (the sanitizer binary's own exit
+    code for this instance, already known not to have crashed). Returns
+    (verdict, detail) where verdict is "match", "mismatch", or
+    "ccc_compile_failed" (ccc's CLI refused to compile something its own
+    --report=json just called safe -- a gate inconsistency, not an
+    emitter bug, but worth surfacing separately rather than silently
+    treating as a match)."""
+    ccc_bin = tmp_dir / f"gen_{idx}_ccc_bin"
+    compile_proc = run([str(CCC_BIN), str(src_path), "-o", str(ccc_bin)])
+    if compile_proc is None or compile_proc.returncode != 0 or not ccc_bin.exists():
+        detail = (compile_proc.stderr if compile_proc else "timeout") or ""
+        return "ccc_compile_failed", detail.strip()[:200]
+    run_proc = run([str(ccc_bin)])
+    if run_proc is None:
+        return "ccc_compile_failed", "ccc-emitted binary timed out"
+    ccc_exit = run_proc.returncode
+    if ccc_exit == ref_exit:
+        return "match", None
+    return "mismatch", f"cc exit={ref_exit} ccc exit={ccc_exit}"
+
+
 def run_one(rng: random.Random, tmp_dir: Path, idx: int):
     template = rng.choice(TEMPLATES)
     src, desc, expect_unsafe = template(rng)
@@ -204,6 +244,13 @@ def run_one(rng: random.Random, tmp_dir: Path, idx: int):
     elif not crashed and not accepted:
         return "fp_candidate", desc, expect_unsafe, None
     else:
+        # "ok" bucket: accepted, well-defined behavior -- the only bucket
+        # where an emitter differential is actually meaningful.
+        ediff_verdict, ediff_detail = emitter_diff(src_path, tmp_dir, idx, run_proc.returncode)
+        if ediff_verdict == "mismatch":
+            return "emitter_mismatch", f"{desc} ({ediff_detail})", expect_unsafe, src
+        elif ediff_verdict == "ccc_compile_failed":
+            return "emitter_inconsistent", f"{desc} ({ediff_detail})", expect_unsafe, src
         return "ok", desc, expect_unsafe, None
 
 
@@ -222,12 +269,14 @@ def main() -> int:
 
     seed = args.seed if args.seed is not None else random.randrange(2**32)
     rng = random.Random(seed)
-    print("GENERATED-PROGRAM FUZZER (FEL-69, item 2)")
+    print("GENERATED-PROGRAM FUZZER (FEL-69, items 2+3)")
     print(f"seed={seed}" + (f" duration={args.duration_secs}s" if args.duration_secs else f" iterations={args.iterations}"))
     print("=" * 78)
 
-    counts = {"ok": 0, "caught": 0, "fp_candidate": 0, "unsound": 0, "inconclusive": 0}
+    counts = {"ok": 0, "caught": 0, "fp_candidate": 0, "unsound": 0, "inconclusive": 0,
+              "emitter_mismatch": 0, "emitter_inconsistent": 0}
     unsound_findings = []
+    emitter_findings = []
     start = time.time()
     i = 0
     with tempfile.TemporaryDirectory() as td:
@@ -252,12 +301,19 @@ def main() -> int:
                 out_path = out_dir / f"finding_{i}.c"
                 out_path.write_text(src)
                 unsound_findings.append((desc, out_path))
+            elif verdict in ("emitter_mismatch", "emitter_inconsistent"):
+                out_dir = Path(tempfile.gettempdir()) / "ccc_generated_fuzz_findings"
+                out_dir.mkdir(exist_ok=True)
+                out_path = out_dir / f"emitter_finding_{i}.c"
+                out_path.write_text(src)
+                emitter_findings.append((verdict, desc, out_path))
             i += 1
 
     total = sum(counts.values())
     print(f"ran {total} generated programs in {time.time() - start:.1f}s")
     print(f"ok={counts['ok']} caught={counts['caught']} fp_candidate={counts['fp_candidate']} "
-          f"inconclusive={counts['inconclusive']} UNSOUND={counts['unsound']}")
+          f"inconclusive={counts['inconclusive']} UNSOUND={counts['unsound']} "
+          f"EMITTER_MISMATCH={counts['emitter_mismatch']} emitter_inconsistent={counts['emitter_inconsistent']}")
     print("=" * 78)
     if unsound_findings:
         for desc, path in unsound_findings:
@@ -265,6 +321,12 @@ def main() -> int:
         print(f"SOUNDNESS BUGS FOUND: {len(unsound_findings)} — see file paths listed above.")
     else:
         print("No new soundness bugs found this run.")
+    if emitter_findings:
+        for verdict, desc, path in emitter_findings:
+            print(f"::warning::generated_fuzz.py found an emitter differential ({verdict}): {desc} -- saved to {path}")
+        print(f"EMITTER DIFFERENTIALS FOUND: {len(emitter_findings)} — see file paths listed above.")
+    else:
+        print("No emitter differentials found this run.")
     return 0
 
 
