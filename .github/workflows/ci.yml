@@ -92,3 +92,20 @@ jobs:
         with:
           name: corpus-scoreboard
           path: corpus-scoreboard.txt
+
+      - name: Run mutation fuzzer (FEL-69)
+        run: |
+          python3 scripts/mutation_fuzz.py | tee mutation-fuzz-report.txt
+          {
+            echo "## Mutation fuzzer (FEL-69)"
+            echo '```'
+            cat mutation-fuzz-report.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload mutation fuzzer report artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mutation-fuzz-report
+          path: mutation-fuzz-report.txt

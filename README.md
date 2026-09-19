@@ -236,6 +236,36 @@ its own `must-reject/` directory, which `scripts/corpus.sh` now checks)
 and the "libheif overlay" write-up in `docs/corpus-results.md` for the
 full account.
 
+### Mutation fuzzer (FEL-69)
+
+The six libheif `must-reject/` mutants above were found by hand — each a
+1-3 line edit, each fooling the verifier at the time. `scripts/mutation_fuzz.py`
+makes that a machine's job for one mutation class so far: for every
+corpus entry's `fixed.c`, it generates every single-comparison-operator
+flip (`<` &harr; `<=`, `>` &harr; `>=`, one flip per mutant) and runs a
+differential oracle on each — `cc -fsanitize=address -fsanitize=undefined`
+as ground truth, `ccc` (verify-only) as the candidate. A mutant the
+sanitizer flags as broken but `ccc` still ACCEPTS is a genuine soundness
+bug: it's auto-filed into that entry's `must-reject/NNN_autofuzz_*.c` with
+a header recording the exact mutation, so `scripts/corpus.sh` picks it up
+on the next run. Run it any time with:
+
+```bash
+lake build ccc
+python3 scripts/mutation_fuzz.py
+```
+
+Like `scripts/corpus.sh`, this is a measurement, not a gate — it always
+exits 0, but prints a `::warning::` (visible in the CI job summary) when
+it files a new must-reject case, since that's a genuinely new finding
+worth a human's attention rather than an already-known scoreboard number.
+Runs in well under a minute against the current 4-entry corpus. Only the
+comparison-operator-flip class is implemented — the rest of FEL-69's
+mutation catalogue (delete a guard, narrow a cast, ±1/×2 a literal, swap
+statements, a second smaller call site, reassign a size variable) needs
+real C-aware transformations a token-regex mutator can't do safely, and
+is tracked as follow-up work under that same ticket.
+
 ## Project structure
 
 ```
