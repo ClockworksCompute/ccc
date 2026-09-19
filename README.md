@@ -286,7 +286,7 @@ examples/           # 7 demo C programs with ./examples/run
 
 ## Version
 
-Current release: **v0.1.2** — see [`CHANGELOG.md`](./CHANGELOG.md).
+Current release: **v0.3.0** — see [`CHANGELOG.md`](./CHANGELOG.md).
 
 ## License
 
