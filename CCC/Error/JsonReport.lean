@@ -109,21 +109,28 @@ def funResultToJson (r : FunVerifyResult) : Json :=
 
 /-- FEL-65 epic DoD bullet 7 ("never call a skipped function verified"):
     a program is only fully verified when every function was, i.e. zero
-    violations AND zero degraded/exempt functions — matching the CLI's
-    own gate in `Main.lean`, which refuses to emit in exactly this case
-    without `--allow-degraded`. Used both for `programReportToJson`'s
+    violations, zero degraded/exempt functions, AND zero top-level
+    constructs the parser had to skip (FEL-55 follow-up — see
+    `Syntax.Program.parseWarnings`) — matching the CLI's own gate in
+    `Main.lean`, which refuses to emit in exactly this case without
+    `--allow-degraded`. Used both for `programReportToJson`'s
     `summary.safe` field and by `Main.lean` for `--report=json`'s exit
     code, so the two can never disagree with each other. Skips the
     synthetic "program" entry `Verify.verifyProgramReport` adds, matching
     `--verify-report`'s own per-function loop in `Main.lean`. -/
-def isFullyVerified (report : ProgramVerifyResult) : Bool :=
+def isFullyVerified (report : ProgramVerifyResult) (parseWarnings : List (String × Loc) := [])
+    : Bool :=
   let fns := report.results.filter (·.funName != "program")
-  fns.all (fun r => r.violations.isEmpty && r.status == .verified)
+  parseWarnings.isEmpty && fns.all (fun r => r.violations.isEmpty && r.status == .verified)
+
+def parseWarningToJson (w : String × Loc) : Json :=
+  Json.mkObj [("message", Json.str w.1), ("loc", locToJson w.2)]
 
 /-- The full program report as JSON. Skips the synthetic "program" entry
     `Verify.verifyProgramReport` adds, matching `--verify-report`'s own
     per-function loop in `Main.lean`. -/
-def programReportToJson (filename : String) (report : ProgramVerifyResult) : Json :=
+def programReportToJson (filename : String) (report : ProgramVerifyResult)
+    (parseWarnings : List (String × Loc) := []) : Json :=
   let fns := report.results.filter (·.funName != "program")
   let totalViolations : Nat := (fns.map (·.violations.length)).foldl (·+·) 0
   let verified : Nat := (fns.filter (·.status == .verified)).length
@@ -133,13 +140,14 @@ def programReportToJson (filename : String) (report : ProgramVerifyResult) : Jso
   Json.mkObj [
     ("file", Json.str filename),
     ("functions", Json.arr (fns.map funResultToJson).toArray),
+    ("parseWarnings", Json.arr (parseWarnings.map parseWarningToJson).toArray),
     ("summary", Json.mkObj [
       ("totalFunctions", totalFunctions),
       ("verified", verified),
       ("degraded", degraded),
       ("exempt", exempt),
       ("totalViolations", totalViolations),
-      ("safe", Json.bool (isFullyVerified report))
+      ("safe", Json.bool (isFullyVerified report parseWarnings))
     ])
   ]
 

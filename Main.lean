@@ -19,17 +19,19 @@ def usage : String :=
   "  --verify-report: print per-function verification status.\n" ++
   "  --report=json: print the same verification result as one line of\n" ++
   "    JSON ({file, functions: [{name, status, violations, degradedReasons}],\n" ++
-  "    summary: {totalFunctions, verified, degraded, exempt, totalViolations,\n" ++
-  "    safe}}) for programmatic consumers instead of the prose report.\n" ++
-  "    Exits 0 iff `summary.safe` is true.\n" ++
+  "    parseWarnings: [{message, loc}], summary: {totalFunctions, verified,\n" ++
+  "    degraded, exempt, totalViolations, safe}}) for programmatic consumers\n" ++
+  "    instead of the prose report. Exits 0 iff `summary.safe` is true.\n" ++
   "  --allow-degraded: by default, ccc refuses to emit (exits 1) when any\n" ++
   "    function was analysed with reduced precision (`degraded`: it uses\n" ++
-  "    goto/labels, or has a switch case that can fall through) OR had\n" ++
-  "    verification SKIPPED ENTIRELY (`exempt`: it calls setjmp) — even if\n" ++
-  "    zero violations were found in what could be analysed. Neither was\n" ++
-  "    proven memory-safe, and treating either the same as a fully\n" ++
-  "    verified function would be dishonest. Pass this flag to emit\n" ++
-  "    anyway; the degraded/exempt function(s) and why are still printed.\n" ++
+  "    goto/labels, or has a switch case that can fall through), had\n" ++
+  "    verification SKIPPED ENTIRELY (`exempt`: it calls setjmp), OR when\n" ++
+  "    a top-level construct could not be parsed at all and was silently\n" ++
+  "    dropped — even if zero violations were found in what could be\n" ++
+  "    analysed. None of these were proven memory-safe, and treating any\n" ++
+  "    of them the same as a fully verified program would be dishonest.\n" ++
+  "    Pass this flag to emit anyway; exactly what was degraded, exempt,\n" ++
+  "    or skipped (and why) is still printed.\n" ++
   "  --harden: EXPERIMENTAL (FEL-59, in progress). Emit a binary even when\n" ++
   "    the verifier finds violations it cannot clear, with a loud warning\n" ++
   "    naming exactly what was not proven. Exit code stays 0. As of this\n" ++
@@ -139,6 +141,14 @@ def main (args : List String) : IO UInt32 := do
           for r in report.results do
             if r.funName != "program" then
               IO.println (formatFunReport r)
+          -- FEL-55/FEL-65 epic DoD bullet 7 follow-up: this report is
+          -- only ever about what parsed — say so explicitly when
+          -- something didn't.
+          if !prog.parseWarnings.isEmpty then
+            IO.println ""
+            IO.println s!"⚠ {prog.parseWarnings.length} top-level construct(s) could not be parsed and are NOT included above:"
+            for (msg, loc) in prog.parseWarnings do
+              IO.println s!"  at {loc.line}:{loc.col}: {msg}"
           return 0
   | ["--report=json", inputFile] => do
       -- FEL-70: structured output for programmatic consumers (corpus.sh,
@@ -156,9 +166,9 @@ def main (args : List String) : IO UInt32 := do
           return 1
       | .ok prog =>
           let report := CCC.Verify.verifyProgramReport prog
-          let reportJson := CCC.Error.programReportToJson filename report
+          let reportJson := CCC.Error.programReportToJson filename report prog.parseWarnings
           IO.println reportJson.compress
-          return (if CCC.Error.isFullyVerified report then 0 else 1)
+          return (if CCC.Error.isFullyVerified report prog.parseWarnings then 0 else 1)
   | _ => pure ()
 
   -- Strip any leading `--harden` / `--allow-degraded` flags, in either
@@ -226,17 +236,39 @@ def main (args : List String) : IO UInt32 := do
   -- between "reduced precision but attempted" and "skipped outright"
   -- would need a second flag, left for whenever that granularity is
   -- actually requested rather than added speculatively here).
+  -- FEL-67/FEL-55 (FEL-65 epic DoD bullet 7, "never call a skipped
+  -- function verified"): three ways a report can be less complete than
+  -- it looks, all gated under the same `--allow-degraded` lever (there
+  -- is no finer-grained flag yet) and all reported TOGETHER when more
+  -- than one applies, rather than only whichever is checked first --
+  -- a caller fixing one must not be surprised by a second still-hidden
+  -- issue on the next run.
+  --   - `degraded`: analysed, but with reduced precision (goto, a
+  --     switch case that can fall through) -- NOT proven memory-safe.
+  --   - `exempt`: verification SKIPPED ENTIRELY (setjmp, varargs) --
+  --     worse than degraded, not milder.
+  --   - a top-level construct the parser could not parse at all: worse
+  --     still -- silently DROPPED with no trace anywhere unless this is
+  --     checked, so the report (which only ever sees what DID parse)
+  --     could look completely clean while an entire additional
+  --     function, of unknown content, was never considered at all.
   let unverifiedFns : List CCC.Syntax.FunVerifyResult :=
     match result.verifyResult with
     | some vr => vr.results.filter (fun r =>
         r.funName != "program" && (r.status == .degraded || r.status == .exempt))
     | none => []
-  if !unverifiedFns.isEmpty && !allowDegraded then
+  if (!unverifiedFns.isEmpty || !result.parseWarnings.isEmpty) && !allowDegraded then
     IO.eprintln ""
-    IO.eprintln s!"ERROR: {unverifiedFns.length} function(s) were NOT fully verified (degraded or exempt):"
-    for r in unverifiedFns do
-      IO.eprintln s!"  {formatFunReport r}"
-    IO.eprintln "Pass --allow-degraded to compile anyway (these functions were not fully checked)."
+    if !unverifiedFns.isEmpty then
+      IO.eprintln s!"ERROR: {unverifiedFns.length} function(s) were NOT fully verified (degraded or exempt):"
+      for r in unverifiedFns do
+        IO.eprintln s!"  {formatFunReport r}"
+    if !result.parseWarnings.isEmpty then
+      IO.eprintln s!"ERROR: {result.parseWarnings.length} top-level construct(s) could not be parsed and were SKIPPED:"
+      for (msg, loc) in result.parseWarnings do
+        IO.eprintln s!"  at {loc.line}:{loc.col}: {msg}"
+      IO.eprintln "The report above is only about what DID parse -- an unknown amount of additional source was never analysed at all."
+    IO.eprintln "Pass --allow-degraded to compile anyway (these were not fully checked)."
     return 1
 
   -- FEL-40: `CCC.compile` never produces assembly for a program with

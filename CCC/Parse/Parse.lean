@@ -29,6 +29,22 @@ structure ParseState where
   -- struct declared this way, an extremely common real-world C pattern.
   pendingStructs : List StructDef := []
   lastParamsVariadic : Bool := false
+  -- FEL-55/FEL-65 epic DoD bullet 7 follow-up: when a top-level
+  -- construct fails to parse, `parseTopLevelItem`'s `.error` branch
+  -- recovers by skipping forward to the next recognizable top-level
+  -- boundary (`skipToTopLevel`) and just continuing — the failed
+  -- construct (which may be an entire function) is otherwise dropped
+  -- with ZERO trace anywhere: not in `Program`, not in any report, not
+  -- even a count. A file with 3 unparseable functions out of 10 would
+  -- silently produce a report only about the other 7, with nothing
+  -- distinguishing that from a file that genuinely only had 7 functions
+  -- — worse than a violation on a known function, since there is no way
+  -- to even know the other 3 existed. Recorded here (message, location)
+  -- so `Parse.parseProgram` can carry it into `Program.parseWarnings`
+  -- and the CLI can refuse to call the result "verified" without saying
+  -- so, the same way it already refuses for `degraded`/`exempt`
+  -- functions.
+  skippedTopLevel : List (String × Loc) := []
   deriving Repr
 
 abbrev Parser (α : Type) := ExceptT String (StateM ParseState) α
@@ -1535,19 +1551,24 @@ partial def parseTopLevelItem (tl : TopLevel) : Parser (Option TopLevel) := do
               modify fun s => { s with pendingGlobals := [], pendingExterns := [] }
               pure (some { tl with globals := newGlobals ++ tl.globals,
                                     externs := newExterns ++ tl.externs })
-          | .error _ =>
+          | .error errMsg =>
               set saved
-              modify fun s => { s with pendingGlobals := [], pendingExterns := [] }
+              modify fun s => { s with
+                pendingGlobals := [],
+                pendingExterns := [],
+                skippedTopLevel := s.skippedTopLevel ++ [(errMsg, tok.loc)] }
               skipToTopLevel
               pure (some tl)
 
 partial def parseTopLevelLoop (tl : TopLevel) : Parser Program := do
   match ← parseTopLevelItem tl with
   | none =>
+      let st ← get
       pure { structs := tl.structs.reverse, unions := tl.unions.reverse,
              enums := tl.enums.reverse, typedefs := tl.typedefs.reverse,
              globals := tl.globals.reverse, externs := tl.externs.reverse,
-             functions := tl.functions.reverse }
+             functions := tl.functions.reverse,
+             parseWarnings := st.skippedTopLevel }
   | some tl' => parseTopLevelLoop tl'
 
 def parseProgramTokens : Parser Program :=

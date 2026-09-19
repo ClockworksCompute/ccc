@@ -225,6 +225,14 @@ structure Program where
   globals   : List GlobalDecl
   externs   : List ExternDecl
   functions : List FunDef
+  -- FEL-55/FEL-65 epic DoD bullet 7 follow-up: (message, location) for
+  -- every top-level construct the parser could not parse and had to
+  -- skip — see `Parse.ParseState.skippedTopLevel`'s docstring for why
+  -- this exists. Empty for the overwhelming majority of real programs;
+  -- non-empty means the report below is about LESS of the source file
+  -- than it looks like, and every caller (the CLI gate, `--report=json`)
+  -- must say so rather than silently reporting only what parsed.
+  parseWarnings : List (String × Loc) := []
   deriving Repr, Inhabited
 
 -- Convenience accessors

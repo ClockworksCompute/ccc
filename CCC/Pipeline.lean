@@ -15,6 +15,11 @@ structure CompileResult where
   verifyResult   : Option Syntax.ProgramVerifyResult
   violations     : List Syntax.SafetyViolation
   report         : String
+  -- FEL-55/FEL-65 epic DoD bullet 7 follow-up: (message, location) for
+  -- every top-level construct the parser had to silently skip — see
+  -- `Syntax.Program.parseWarnings`'s docstring. Empty when parsing
+  -- failed outright too (nothing partial to report in that case).
+  parseWarnings  : List (String × Syntax.Loc) := []
   deriving Repr
 
 /-- Build a ProgramVerifyResult from a flat list of violations (for error reporting). -/
@@ -47,17 +52,20 @@ def compile (source : String) (filename : String) : CompileResult :=
         { assembly := some asm
           verifyResult := some vprog.evidence
           violations := []
-          report := Error.formatSuccess vprog.evidence filename .verified }
+          report := Error.formatSuccess vprog.evidence filename .verified
+          parseWarnings := prog.parseWarnings }
       | .error emitErr =>
         { assembly := none
           verifyResult := some vprog.evidence
           violations := []
-          report := s!"ERROR: Emission error in {filename}:\n  {emitErr}" }
+          report := s!"ERROR: Emission error in {filename}:\n  {emitErr}"
+          parseWarnings := prog.parseWarnings }
     | .error violations =>
       { assembly := none
         verifyResult := some (violationsToResult violations)
         violations := violations
-        report := Error.formatResult (violationsToResult violations) source filename }
+        report := Error.formatResult (violationsToResult violations) source filename
+        parseWarnings := prog.parseWarnings }
 
 /-- Explicit, deliberately-not-CLI-wired escape hatch: emit assembly for a
     program even though the verifier rejected it. This exists for the
@@ -78,18 +86,22 @@ def compileIgnoringViolations (source : String) (filename : String)
       match emitProgram vprog .aarch64 harden with
       | .ok asm =>
         { assembly := some asm, verifyResult := some vprog.evidence, violations := []
-          report := Error.formatSuccess vprog.evidence filename .verified }
+          report := Error.formatSuccess vprog.evidence filename .verified
+          parseWarnings := prog.parseWarnings }
       | .error emitErr =>
         { assembly := none, verifyResult := some vprog.evidence, violations := []
-          report := s!"ERROR: Emission error in {filename}:\n  {emitErr}" }
+          report := s!"ERROR: Emission error in {filename}:\n  {emitErr}"
+          parseWarnings := prog.parseWarnings }
     | .error violations =>
       let verifyResult := violationsToResult violations
       match Emit.emitProgramAArch64 prog harden with
       | .ok asm =>
         { assembly := some asm, verifyResult := some verifyResult, violations := violations
-          report := Error.formatResult verifyResult source filename }
+          report := Error.formatResult verifyResult source filename
+          parseWarnings := prog.parseWarnings }
       | .error _ =>
         { assembly := none, verifyResult := some verifyResult, violations := violations
-          report := Error.formatResult verifyResult source filename }
+          report := Error.formatResult verifyResult source filename
+          parseWarnings := prog.parseWarnings }
 
 end CCC
