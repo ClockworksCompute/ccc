@@ -1,5 +1,47 @@
 # CVE regression corpus — baseline results
 
+## 2026-09-19 (fifth update) — libpng-cve-2015-8126 reclassified
+## false-positive → missed: an incidental null-deref masked the real test
+
+**Against commit:** `c9f1cf9` on `main`.
+
+`libpng-cve-2015-8126`'s `vulnerable.c`/`fixed.c` both call
+`malloc(sizeof(struct png_struct))` in `main()` and never null-check the
+result before dereferencing it (`png_ptr->num_palette` at the very end).
+`ccc` correctly flags that as a possible null-pointer dereference — on
+BOTH files, identically — which is why `scripts/corpus.sh` scored this
+entry `false-positive` ("fixed.c flagged at line 52"): the verdict was
+entirely about this incidental null-check gap, never about the actual
+bug under test (the missing `num_palette` clamp against the 256-entry
+palette array). The equivalent libheif entry already had this exact
+masking problem fixed at some point in its own history (see its own
+`trigger.txt`'s progress notes); the two libpng entries never did.
+
+Added `if (!png_ptr) { return -1; }` right after the `malloc` call in
+both files (verified this doesn't change either file's actual test
+intent — the clamp bug is entirely inside `png_set_PLTE_*`, independent
+of this guard). Result: **both files are now ACCEPTED** — the real
+palette-overflow bug is not caught at all, reclassifying this entry from
+`false-positive` to `missed`. This is a more honest number, not a
+regression: the null-check masking was never testing what this entry
+claims to test, and unmasking it revealed a real, separate, previously
+undocumented general soundness gap — see the note filed as a new ticket
+(a fixed-capacity array or struct-field array indexed inside a loop
+bounded by an ORDINARY, unbounded PARAMETER is silently accepted with no
+violation and no "runtime-bounded" proof actually performed; confirmed
+directly with a minimal, ASan-verified repro unrelated to this corpus
+entry — see the tracker for specifics). This is squarely
+`FEL-42..48`-class relational-analysis work, not attempted as part of
+this fix.
+
+Current scoreboard: **0/4 detected, missed=2 (`libheif-overlay-85e21ad`,
+now also `libpng-cve-2015-8126`), false-positive=2
+(`libpng-cve-2018-13785`, `libwebp-cve-2023-4863`)**. Note: this doc's
+earlier sections below are dated snapshots and may not reflect later
+commits between updates — `scripts/corpus.sh`'s live output is always
+authoritative over any written snapshot, including this one once more
+time passes.
+
 ## 2026-09-19 (fourth update) — libheif-overlay-85e21ad DEMOTED back to
 ## false-positive: the "detected" mechanism was unsound (FEL-64)
 

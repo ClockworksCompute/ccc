@@ -216,10 +216,12 @@ scripts/corpus.sh
 
 Baseline status (see [`docs/corpus-results.md`](./docs/corpus-results.md)
 for the full writeup): **0 of 4 entries detected.** `libwebp-cve-2023-4863`
-is **missed** — `ccc` accepts the vulnerable version outright, since the
-verifier does not yet track integer overflow. The other three
-(`libheif-overlay-85e21ad`, `libpng-cve-2015-8126`, `libpng-cve-2018-13785`)
-are **false-positive** — `ccc` rejects the vulnerable version, but rejects
+and `libpng-cve-2015-8126` are **missed** — `ccc` accepts both the
+vulnerable and fixed versions outright, since the verifier does not yet
+track integer overflow, nor relate a fixed-capacity buffer to a loop
+bound that is an ordinary (unbounded) parameter. The other two
+(`libheif-overlay-85e21ad`, `libpng-cve-2018-13785`) are
+**false-positive** — `ccc` rejects the vulnerable version, but rejects
 the fixed version identically, unable to relate a runtime clamp/bounds
 check to the buffer it protects. This is not a typo or an oversight — the
 corpus exists precisely to make that number improve (or regress)
