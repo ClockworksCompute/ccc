@@ -15,10 +15,13 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - A top-level `int table[8];` (with or without a brace initializer) used to vanish from the compiled program entirely — the parser branch for global array declarations never registered the symbol at all, not merely its initial values. Real C code (lookup tables, CRC tables, coefficient tables) relies on this pattern heavily. Now registers a real `.array` global with its actual size, and a brace initializer's element values are kept and emitted to a proper `.data` section, width-correct per element type (`char`=1 byte, `short`=2, `int`=4, `long`=8) with C's zero-padding rule for elements the initializer list doesn't provide. Cross-checked directly against `cc` compiling the identical source.
 
+- An enum constant used as an expression (`enum Color { RED, GREEN, BLUE }; return RED;`) previously failed emission outright with "unknown variable 'RED'" — `enum` member values were computed correctly but nothing ever consulted that table when a member name appeared in an expression. Enums are everywhere in real C headers (error codes, flags, state machines), so this was a hard, immediate compile failure for most real libraries that declare one. Fixed by `CCC.Syntax.EnumResolve`, a post-parse rewrite (run automatically at the end of `Parse.parseProgram`, so every caller sees it uniformly) that replaces every enum-constant-name expression with its resolved integer literal, following C's "0, then previous+1 unless overridden" value rule. Known limitation: `switch` case labels (`case RED:`) are resolved earlier, during parsing, before this table exists, and still silently become `case 0:` — a separate, smaller follow-up.
+
 ### Added
 - `test/StructLayoutTest.lean` (10 cases) for the struct-alignment and `sizeof(expr)` fixes above.
 - `test/StackArgsTest.lean` (6 cases) for the stack-argument fix, including three that link CCC-compiled code against real `cc` output on one side of the call.
 - `test/GlobalArrayTest.lean` (7 cases) for the global array fix, including one cross-checked directly against `cc`.
+- `test/EnumResolveTest.lean` (7 cases) for the enum-resolution fix, including one cross-checked directly against `cc`.
 
 ## [0.2.0] - 2026-09-19
 

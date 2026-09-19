@@ -1,4 +1,5 @@
 import CCC.Parse.Lex
+import CCC.Syntax.EnumResolve
 
 namespace CCC.Parse
 
@@ -1476,6 +1477,13 @@ def parseProgramTokens : Parser Program :=
 
 def parseProgram (source : String) : Except String Program := do
   let toks : List Token ← tokenize source
-  runParser parseProgramTokens toks
+  let prog ← runParser parseProgramTokens toks
+  -- FEL-68: resolve every enum-constant NAME used as an expression to
+  -- its integer value here, as the parser's final step, so EVERY caller
+  -- of `parseProgram` (the verifier, both emitters, `--verify-report`,
+  -- every test helper) sees an already-resolved program uniformly. See
+  -- CCC.Syntax.EnumResolve's docstring for exactly what this does and
+  -- does not cover.
+  pure (CCC.Syntax.EnumResolve.resolveProgram prog)
 
 end CCC.Parse

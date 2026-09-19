@@ -184,6 +184,7 @@ lake env lean --run test/HardenTest.lean           #  5/5  — --harden runtime 
 lake env lean --run test/StructLayoutTest.lean     # 10/10 — struct alignment, sizeof(expr)
 lake env lean --run test/StackArgsTest.lean        #  6/6  — AAPCS64 stack args (>8 params)
 lake env lean --run test/GlobalArrayTest.lean      #  7/7  — global array declarations/initializers
+lake env lean --run test/EnumResolveTest.lean      #  7/7  — enum constant resolution
 lake env lean --run test/E2EAllDemos.lean          # demo programs
 
 bash test/regression/run_regressions.sh             # numbered CCC-BUG-NNN repros
