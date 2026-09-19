@@ -59,7 +59,7 @@ jobs:
                    PreprocessTest TypedefTest VerifierAccuracyTest E2EAllDemos \
                    VerifyAllDemos ParseAllDemos PreprocessElifTest EmitAndRun \
                    MacroTest MacroTest2 MacroTest3 SignednessTest \
-                   VerifierFixesTest HardenTest StructLayoutTest; do
+                   VerifierFixesTest HardenTest StructLayoutTest StackArgsTest; do
             echo "::group::$t"
             if ! lake env lean --run "test/$t.lean"; then
               echo "::error::$t FAILED"

@@ -47,6 +47,21 @@ structure ArmCodegenState where
   -- Defaults to false everywhere except the explicit --harden path, so
   -- ordinary compilation is byte-for-byte unchanged.
   harden       : Bool := false
+  -- FEL-68: declared parameter TYPES for every known function (from both
+  -- definitions and extern prototypes), used by `emitArmCall` to size the
+  -- 9th+ (stack-passed) argument's packed slot from the CALLEE's own
+  -- declared type — the semantically correct source (C argument
+  -- promotion follows the visible prototype's parameter type, not
+  -- whatever type the caller's own expression happens to look like) —
+  -- rather than `inferExprType`'s necessarily coarser guess about the
+  -- argument expression itself (which, e.g., reports a bare integer
+  -- literal as `.long` regardless of the narrower type it will actually
+  -- be stored as). Falls back to `inferExprType` per-argument when the
+  -- callee isn't in this table (an unprototyped/unknown function, which
+  -- `SymbolCheck` already tolerates elsewhere) or doesn't have enough
+  -- declared parameters for the position in question (e.g. the variadic
+  -- tail of a `printf`-shaped call).
+  funcParamTypes : List (String × List CType) := []
 
 abbrev ArmCodegenM := StateT ArmCodegenState (Except String)
 
@@ -664,18 +679,72 @@ partial def emitArmCompoundAssign (env : TypeEnv) (lhs : Expr) (rhs : Expr) (op 
   -- Store result back
   emitArmStoreWidth .x0 .x9 0 sz
 
+/-- FEL-68 (was FEL-51): calls with more than `armArgRegs.length` (8)
+    arguments used to throw "too many arguments" outright — the libheif
+    corpus port had to fold a parameter into another one to fit under
+    this limit. AAPCS64 passes the 9th+ argument on the caller's stack,
+    in an "outgoing argument area" reserved just below the current sp at
+    the moment of `bl`.
+
+    Each stack argument is packed at its OWN natural size/alignment
+    within that area, per `CCC.Syntax.Layout.packedOffsets` — see its
+    docstring for why (Apple's arm64 ABI does not pad every stack
+    argument to 8 bytes, unlike the base AAPCS64 spec; this was found
+    empirically, by an earlier version of this function that used a
+    uniform 8-byte stride failing a real `cc`-compiled-callee test while
+    passing every CCC-only self-consistency test). The value is evaluated
+    and stored WIDTH-CORRECTLY (`emitArmStoreWidth`, matching the arg's
+    real C type size) to its packed slot IMMEDIATELY after reserving the
+    area, before touching any register argument: a fixed-offset store
+    never moves `sp`, and every earlier stack argument's own evaluation
+    is itself balanced (any push/pop or nested call it contains nets to
+    zero SP change), so `sp` is guaranteed to still equal the reserved
+    area's base by the time each one executes. Register arguments (the
+    first 8) are evaluated and handled afterwards via the pre-existing
+    push-then-pop-in-reverse pattern, itself balanced too. -/
 partial def emitArmCall (env : TypeEnv) (fn : String) (args : List Expr) : ArmCodegenM Unit := do
-  if args.length > armArgRegs.length then
-    throw s!"too many arguments for call to '{fn}'"
-  -- Evaluate each arg and push onto stack
-  for arg in args do
-    emitArmExpr env arg
-    emitArmPush .x0
-  -- Pop into argument registers in reverse order
-  let regsToUse := (armArgRegs.take args.length).reverse
-  for reg in regsToUse do
-    emitArmPop reg
-  emitArmInstr (.bl (builtinName fn))
+  let nRegArgs := min args.length armArgRegs.length
+  let regArgs := args.take nRegArgs
+  let stackArgs := args.drop nRegArgs
+  if !stackArgs.isEmpty then
+    let st ← get
+    -- Prefer the callee's own declared parameter types (see
+    -- `funcParamTypes`'s docstring on why); fall back to inferring each
+    -- argument expression's type only when the callee isn't known or
+    -- doesn't declare enough parameters for this position.
+    let declared? := (st.funcParamTypes.find? (·.1 == fn)).map (·.2 |>.drop nRegArgs)
+    let stackTypes := match declared? with
+      | some declTys =>
+          if declTys.length == stackArgs.length then
+            declTys.map (resolveType st.typedefs)
+          else
+            stackArgs.map (fun a => resolveType st.typedefs (inferExprType env st.structDefs a))
+      | none => stackArgs.map (fun a => resolveType st.typedefs (inferExprType env st.structDefs a))
+    let (offsets, packedSize) := Layout.packedOffsets st.structDefs stackTypes
+    let stackBytes := roundUp16 packedSize
+    emitArmInstr (.sub_imm .sp .sp (Int.ofNat stackBytes))
+    for ((arg, ty), off) in stackArgs.zip stackTypes |>.zip offsets do
+      emitArmExpr env arg
+      emitArmStoreWidth .x0 .sp (Int.ofNat off) (cTypeSize st.structDefs ty)
+    -- Evaluate each register arg and push onto stack
+    for arg in regArgs do
+      emitArmExpr env arg
+      emitArmPush .x0
+    let regsToUse := (armArgRegs.take nRegArgs).reverse
+    for reg in regsToUse do
+      emitArmPop reg
+    emitArmInstr (.bl (builtinName fn))
+    emitArmInstr (.add_imm .sp .sp (Int.ofNat stackBytes))
+  else
+    -- Evaluate each register arg and push onto stack
+    for arg in regArgs do
+      emitArmExpr env arg
+      emitArmPush .x0
+    -- Pop into argument registers in reverse order
+    let regsToUse := (armArgRegs.take nRegArgs).reverse
+    for reg in regsToUse do
+      emitArmPop reg
+    emitArmInstr (.bl (builtinName fn))
 
 end
 
@@ -835,17 +904,52 @@ end
 -- Function and program emission
 -- ═══════════════════════════════════════════════════════════════
 
-def emitArmParamMoves (params : List Param) (offsets : List (String × Int)) : ArmCodegenM Unit := do
-  let pairs := List.zip params armArgRegs
+/-- FEL-68 (was FEL-51): spill every parameter into its local stack slot.
+    `List.zip params armArgRegs` used to silently TRUNCATE at 8 params —
+    a function DEFINED with more than 8 parameters got no error (unlike
+    the call-site throw this pairs with) and no spill code at all for the
+    9th+ parameter, so that local's stack slot was left as whatever
+    garbage was already on the stack: a genuine, silent correctness bug,
+    not just a missing feature.
+
+    The 9th+ parameter is spilled from the CALLER's outgoing
+    stack-argument area (see `emitArmCall`'s docstring for the packed
+    layout — computed HERE from these parameters' own declared types,
+    which a correctly-typed call site necessarily agrees with) rather
+    than a register. At the point `emitArmParamMoves` runs, the prologue
+    has already executed `stp x29, x30, [sp, #-16]!` and `mov x29, sp`,
+    so `x29` sits 16 bytes BELOW the incoming `sp` — the caller placed
+    the packed stack-argument area starting at `[incoming_sp, #0]`,
+    i.e. `[x29, #16 + packedOffset]`. Each is loaded width- and
+    signedness-correctly (`emitArmLoadWidth`, matching `emitArmCall`'s
+    width-correct store on the other end of this same value) into `x0`,
+    then spilled into the local slot with a plain 64-bit store — the
+    same convention the register-parameter path above already uses
+    regardless of the parameter's real declared width. -/
+def emitArmParamMoves (structDefs : List StructDef) (typedefs : List TypedefDecl)
+    (params : List Param) (offsets : List (String × Int)) : ArmCodegenM Unit := do
+  let regParams := params.take armArgRegs.length
+  let stackParams := params.drop armArgRegs.length
+  let pairs := List.zip regParams armArgRegs
   for pair in pairs do
     let (p, reg) := pair
     match lookupOffset offsets p.name with
     | none => throw s!"missing stack slot for parameter '{p.name}'"
     | some off =>
         emitArmInstr (.str reg .x29 off)
+  if !stackParams.isEmpty then
+    let stackTypes := stackParams.map (fun p => resolveType typedefs p.ty)
+    let (packedOffs, _) := Layout.packedOffsets structDefs stackTypes
+    for ((p, ty), packedOff) in stackParams.zip stackTypes |>.zip packedOffs do
+      match lookupOffset offsets p.name with
+      | none => throw s!"missing stack slot for parameter '{p.name}'"
+      | some off =>
+          emitArmLoadWidth structDefs typedefs .x29 (16 + Int.ofNat packedOff) ty
+          emitArmInstr (.str .x0 .x29 off)
 
 def emitArmFunction (structDefs : List StructDef) (typedefs : List TypedefDecl)
     (globalNames : List (String × CType)) (fn : FunDef) (harden : Bool := false)
+    (funcParamTypes : List (String × List CType) := [])
     : Except String (List ArmInstr × List String) := do
   let paramBindings : TypeEnv := fn.params.map (fun (p : Param) => (p.name, p.ty))
   let localBindings : TypeEnv := collectVarDecls fn.body
@@ -867,6 +971,7 @@ def emitArmFunction (structDefs : List StructDef) (typedefs : List TypedefDecl)
     dataSection := []
     loopStack := []
     harden := harden
+    funcParamTypes := funcParamTypes
   }
   let env : TypeEnv := allBindings
   let retLabel : ArmLabel := { fn := fn.name, kind := "ret", idx := 0 }
@@ -877,7 +982,7 @@ def emitArmFunction (structDefs : List StructDef) (typedefs : List TypedefDecl)
     if localsSize > 0 then
       emitArmInstr (.sub_imm .sp .sp (Int.ofNat localsSize))
     -- Spill parameters
-    emitArmParamMoves fn.params offsets
+    emitArmParamMoves structDefs typedefs fn.params offsets
     -- Body
     emitArmStmts env retLabel fn.body
     -- Default return 0 for non-void
@@ -901,10 +1006,22 @@ def renderArmFunction (name : String) (instrs : List ArmInstr) : List String :=
 def emitProgramAArch64 (prog : CCC.Syntax.Program) (harden : Bool := false)
     : Except String String := do
   let globalNames : List (String × CType) := prog.globals.map (fun g => (g.name, g.ty))
+  -- FEL-68: declared parameter types for every function definition AND
+  -- extern prototype in this program, keyed by name — see
+  -- `ArmCodegenState.funcParamTypes`'s docstring for why `emitArmCall`
+  -- needs this rather than inferring each stack argument's type from the
+  -- caller's own expression. Definitions take priority over externs when
+  -- both name the same function (mirrors `SymbolCheck.buildSymbolTable`'s
+  -- own precedence for the same reason: a forward-declared-then-defined
+  -- function's real definition is the more trustworthy source).
+  let funcParamTypes : List (String × List CType) :=
+    (prog.functions.map (fun f => (f.name, f.params.map (·.ty)))) ++
+    (prog.externs.map (fun e => (e.name, e.params.map (·.ty))))
   let mut allInstrs : List String := []
   let mut allData : List String := []
   for fn in prog.functions do
-    let (instrs, dataLines) ← emitArmFunction prog.structs prog.typedefs globalNames fn harden
+    let (instrs, dataLines) ←
+      emitArmFunction prog.structs prog.typedefs globalNames fn harden funcParamTypes
     allInstrs := allInstrs ++ renderArmFunction fn.name instrs
     allData := allData ++ dataLines
   -- Emit global variable storage

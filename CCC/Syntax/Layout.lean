@@ -133,4 +133,34 @@ partial def fieldOffset (defs : List StructDef) (fields : List (String × CType)
         else go rest (paddedOff + sizeOf defs fty)
   go fields 0
 
+/-- Byte offsets for a list of VALUES passed in order (e.g. the 9th+
+    arguments of a call, passed on the stack), each packed at its own
+    natural alignment — NOT padded to a uniform 8-byte slot each. This is
+    Apple's arm64 ABI's documented deviation from the base AAPCS64 spec
+    (which pads every stack argument to 8 bytes): "Writing ARM64 Code for
+    Apple Platforms" specifies that stack-passed arguments are packed as
+    tightly as their own alignment allows, the same rule
+    `paddedStructSize`/`fieldOffset` already implement for struct fields
+    — in fact it's the identical algorithm, just over a plain list of
+    types with no field names needed. Confirmed empirically: two `int`
+    (4-byte) stack arguments must land 4 bytes apart, not 8 — passing
+    them 8 bytes apart (this module's first version) interoperated fine
+    between two CCC-compiled ends (self-consistently wrong) but silently
+    passed the wrong value to/from a real `cc`-compiled function on
+    either side of the call.
+
+    Returns `(perArgOffset, totalPackedSize)`; callers round
+    `totalPackedSize` up to 16 separately when using it to size a stack
+    reservation (sp must stay 16-aligned at a call, but that is a
+    property of the RESERVATION, not of where each argument sits inside
+    it). -/
+def packedOffsets (defs : List StructDef) (types : List CType) : List Nat × Nat :=
+  let (offsetsRev, offset, maxAlign) := types.foldl
+    (fun (accOffsets, off, mxa) ty =>
+      let fa := alignOf defs ty
+      let paddedOff := roundUpTo off fa
+      (paddedOff :: accOffsets, paddedOff + sizeOf defs ty, Nat.max mxa fa))
+    ([], 0, 1)
+  (offsetsRev.reverse, roundUpTo offset maxAlign)
+
 end CCC.Syntax.Layout
