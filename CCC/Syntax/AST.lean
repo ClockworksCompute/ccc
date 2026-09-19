@@ -122,6 +122,15 @@ inductive Expr where
   | callFnPtr (fnExpr : Expr) (args : List Expr) (loc : Loc)
   | nullLit   (loc : Loc)
   | floatLit  (val : Float) (loc : Loc)
+  -- FEL-68: `sizeof(expr)` (as opposed to `sizeof(type)`, the `sizeOf`
+  -- variant above) used to be parsed and then immediately discarded,
+  -- approximated as `sizeof(int)` regardless of what `expr` actually was
+  -- (see the removed comment in `Parse.parseUnary`'s `.kw_sizeof` case).
+  -- This keeps the real operand so its type — and hence its real size —
+  -- can be resolved later, the same way every other type-dependent
+  -- expression already is (`exprType?` in BoundsCheck, `inferExprType` in
+  -- the emitters).
+  | sizeOfExpr (operand : Expr) (loc : Loc)
   deriving Repr, Inhabited
 
 /-- Statements. Every variant carries a Loc. -/
@@ -230,6 +239,7 @@ def loc : Expr → Loc
   | .strLit _ l | .ternary _ _ _ l | .cast _ _ l => l
   | .comma _ _ l | .initList _ l | .callFnPtr _ _ l => l
   | .nullLit l | .floatLit _ l => l
+  | .sizeOfExpr _ l => l
 
 end Expr
 

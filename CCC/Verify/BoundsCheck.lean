@@ -92,6 +92,9 @@ partial def exprType? (ctx : VerifyCtx) (state : FlowState) (expr : Syntax.Expr)
   | .charLit _ _ => some .char
   | .var name _ => state.getType name
   | .sizeOf _ _ => some .sizeT
+  -- FEL-68: `sizeof(expr)`'s own type (as an expression) is always
+  -- size_t, regardless of what `expr` is — matching `.sizeOf ty _` above.
+  | .sizeOfExpr _ _ => some .sizeT
   | .unOp .deref operand _ =>
       match exprType? ctx state operand with
       | some (.pointer elem) => some elem
@@ -592,6 +595,9 @@ def applyDeclRange (ctx : VerifyCtx) (name : String) (init : Syntax.Expr) (state
 partial def checkExpr (ctx : VerifyCtx) (expr : Syntax.Expr) (state : FlowState) : FlowState :=
   match expr with
   | .intLit _ _ | .charLit _ _ | .var _ _ | .sizeOf _ _ => state
+  -- FEL-68: sizeof(expr)'s operand is never evaluated in C, so there's no
+  -- array access, memcpy call, or write inside it to bounds-check.
+  | .sizeOfExpr _ _ => state
   | .binOp op lhs rhs loc =>
       match op with
       | .addAssign | .subAssign | .mulAssign | .divAssign | .modAssign

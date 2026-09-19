@@ -84,6 +84,9 @@ partial def checkExpr (table : List (String × SymEntry)) (currentFun : String)
   | .assign lhs rhs _ =>
       checkExpr table currentFun lhs ++ checkExpr table currentFun rhs
   | .intLit _ _ | .charLit _ _ | .var _ _ | .sizeOf _ _ => []
+  -- FEL-68: sizeof(expr)'s operand is never evaluated, so any call inside
+  -- it (e.g. `sizeof(f())`) never actually runs — nothing to validate.
+  | .sizeOfExpr _ _ => []
   -- Phase 2 Expr
   | .strLit _ _ | .nullLit _ | .floatLit _ _ => []
   | .ternary c t e _ =>

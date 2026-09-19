@@ -334,6 +334,14 @@ def main : IO UInt32 := do
             else
               IO.eprintln s!"✗ FEL55_typedef_struct_own_name_fields: exit {runOut.exitCode}, expected 42"
 
+  -- FEL-68: sizeof(expr)'s operand is never evaluated in C (well-defined,
+  -- no dereference actually happens), so `sizeof(*null_ptr)` must NOT be
+  -- flagged as a null-pointer dereference.
+  total := total + 1
+  if ← expectClean "FEL68_sizeof_expr_operand_not_evaluated"
+    "int main() { int *p = 0; return sizeof(*p); }\n"
+  then pass := pass + 1
+
   -- FEL-67: degraded status (goto, or a fall-through switch case) must be
   -- computed AND reported — a function analysed with reduced precision is
   -- not "verified" just because zero violations were found in the parts

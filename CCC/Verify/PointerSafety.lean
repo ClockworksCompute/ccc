@@ -238,6 +238,10 @@ private def transitionPtrWrite (ctx : VerifyCtx) (state : FlowState) (name : Str
 partial def checkExpr (ctx : VerifyCtx) (expr : Syntax.Expr) (state : FlowState) : FlowState :=
   match expr with
   | .intLit _ _ | .charLit _ _ | .var _ _ | .sizeOf _ _ => state
+  -- FEL-68: sizeof(expr)'s operand is never evaluated in C
+  -- (`sizeof(*null_ptr)` is well-defined and never dereferences), so no
+  -- use-after-free/double-free tracking applies inside it either.
+  | .sizeOfExpr _ _ => state
   | .binOp _ lhs rhs _ =>
       let s1 := checkExpr ctx lhs state
       checkExpr ctx rhs s1

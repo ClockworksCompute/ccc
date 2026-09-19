@@ -473,10 +473,16 @@ partial def parseUnary : Parser Expr := do
         let _ ← expectKind .rparen "')' after sizeof(type)"
         pure (.sizeOf ty tok.loc)
       else
-        -- sizeof(expr) — parse expression, treat as sizeof(int) for now
-        let _ ← parseExpr 0
+        -- FEL-68: sizeof(expr) — the operand's real type (and hence real
+        -- size) is resolved later by whoever consumes this node
+        -- (BoundsCheck.exprType?/resolveExprNat for the verifier,
+        -- inferExprType for the emitters), the same way every other
+        -- type-dependent expression already works. Previously the parsed
+        -- expression was discarded entirely and this was approximated as
+        -- `sizeof(int)` regardless of what it actually was.
+        let operand : Expr ← parseExpr 0
         let _ ← expectKind .rparen "')' after sizeof(expr)"
-        pure (.sizeOf .int tok.loc)  -- approximate: treat as sizeof(int)
+        pure (.sizeOfExpr operand tok.loc)
   | .lparen =>
       -- Could be: (expr), (type)expr (cast), or (type){init} (compound literal)
       -- Try cast: check if next tokens form a type

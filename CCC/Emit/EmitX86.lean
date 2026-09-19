@@ -1,4 +1,5 @@
 import CCC.Syntax.AST
+import CCC.Syntax.Layout
 import CCC.Emit.X86
 import CCC.Emit.Runtime
 
@@ -55,37 +56,17 @@ def findStructDef (defs : List StructDef) (name : String) : Option StructDef :=
       if d.name = name then some d else findStructDef rest name
 
 
-partial def cTypeSize (defs : List StructDef) (ty : CType) : Nat :=
-  match ty with
-  | .void => 0
-  | .int => 4
-  | .char => 1
-  | .long => 8
-  | .bool => 1
-  | .unsigned inner => cTypeSize defs inner
-  | .pointer _ => 8
-  | .array elem n => n * cTypeSize defs elem
-  | .struct_ name =>
-      match findStructDef defs name with
-      | none => 0
-      | some s =>
-          s.fields.foldl (fun acc field =>
-            let (_, fTy) := field
-            acc + cTypeSize defs fTy) 0
-  | .sizeT => 8
-  -- Phase 2 types
-  | .float_ => 4
-  | .double_ => 8
-  | .short => 2
-  | .longLong => 8
-  | .signed inner => cTypeSize defs inner
-  | .enum_ _ => 4
-  | .union_ _ => 0              -- TODO: look up union def
-  | .funcPtr _ _ => 8
-  | .typedef_ _ => 8            -- fallback; callers should resolveType first
-  | .const_ inner => cTypeSize defs inner
-  | .volatile_ inner => cTypeSize defs inner
-  | .restrict_ inner => cTypeSize defs inner
+/-- FEL-68: this used to sum field sizes with no alignment padding
+    (`struct P { char c; int x; long y; }` came out to 13 bytes at offsets
+    0/1/5 instead of the real ABI's 16 bytes at 0/4/8), which any code
+    interoperating with a real C-compiled library — the whole point of
+    FEL-65 — would disagree with. Now a thin wrapper over
+    `CCC.Syntax.Layout.sizeOf`, which both this and `lookupFieldOffset`
+    below delegate to, so size and offset can never disagree with each
+    other. See that module's docstring for exactly what is and isn't
+    covered yet (notably: unions still size as 0). -/
+def cTypeSize (defs : List StructDef) (ty : CType) : Nat :=
+  CCC.Syntax.Layout.sizeOf defs ty
 
 
 def lookupFieldType (defs : List StructDef) (structName : String) (fieldName : String) : Option CType :=
@@ -100,19 +81,15 @@ def lookupFieldType (defs : List StructDef) (structName : String) (fieldName : S
       go s.fields
 
 
+/-- FEL-68: same padded layout as `cTypeSize` above, via
+    `CCC.Syntax.Layout.fieldOffset` — previously this accumulated offsets
+    with the same no-padding formula `cTypeSize` used to, which was
+    internally consistent with the old `cTypeSize` but not with real C
+    struct layout. -/
 def lookupFieldOffset (defs : List StructDef) (structName : String) (fieldName : String) : Option Int :=
   match findStructDef defs structName with
   | none => none
-  | some s =>
-      let rec go (fields : List (String × CType)) (acc : Nat) : Option Int :=
-        match fields with
-        | [] => none
-        | (fname, fty) :: rest =>
-            if fname = fieldName then
-              some (Int.ofNat acc)
-            else
-              go rest (acc + cTypeSize defs fty)
-      go s.fields 0
+  | some s => (CCC.Syntax.Layout.fieldOffset defs s.fields fieldName).map Int.ofNat
 
 
 def emitInstr (instr : Instr) : CodegenM Unit := do
@@ -248,6 +225,7 @@ partial def inferExprType (env : TypeEnv) (defs : List StructDef) (expr : Expr) 
       | _ => .long
   | .call _ _ _ => .long
   | .sizeOf _ _ => .sizeT
+  | .sizeOfExpr _ _ => .sizeT
   | .assign lhs _ _ => inferExprType env defs lhs
   -- Phase 2 Expr
   | .strLit _ _ => .pointer .char
@@ -731,6 +709,15 @@ partial def emitExpr (env : TypeEnv) (expr : Expr) : CodegenM Unit := do
   | .sizeOf ty _ =>
       let st <- get
       let resolvedTy := resolveType st.typedefs ty
+      emitInstr (.mov (.imm (Int.ofNat (cTypeSize st.structDefs resolvedTy))) (.reg .rax))
+  | .sizeOfExpr operand _ =>
+      -- FEL-68: sizeof(expr) — the operand is NOT evaluated (matching C
+      -- semantics: `sizeof(*null_ptr)` is well-defined and never
+      -- dereferences), only its inferred TYPE is used, exactly like the
+      -- `.sizeOf ty _` case just above.
+      let st <- get
+      let opTy := inferExprType env st.structDefs operand
+      let resolvedTy := resolveType st.typedefs opTy
       emitInstr (.mov (.imm (Int.ofNat (cTypeSize st.structDefs resolvedTy))) (.reg .rax))
   | .assign lhs rhs _ =>
       emitExpr env rhs

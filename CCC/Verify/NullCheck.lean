@@ -51,6 +51,9 @@ partial def checkExpr (ctx : VerifyCtx) (expr : Syntax.Expr) (state : FlowState)
       let s1 := checkExpr ctx lhs state
       checkExpr ctx rhs s1
   | .intLit _ _ | .charLit _ _ | .var _ _ | .sizeOf _ _ => state
+  -- FEL-68: sizeof(expr)'s operand is never evaluated in C, so there's
+  -- nothing to null-check inside it — same leaf treatment as `.sizeOf`.
+  | .sizeOfExpr _ _ => state
   -- Phase 2 Expr
   | .strLit _ _ | .nullLit _ | .floatLit _ _ => state
   | .ternary c t e _ =>

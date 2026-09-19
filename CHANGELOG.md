@@ -4,6 +4,16 @@ All notable changes to CCC are documented in this file.
 
 This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+- A function marked `degraded` (uses `goto`/labels, or has a switch case that can fall through) now actually blocks `ccc` from exiting 0 — previously this status was computed but never checked anywhere; `--verify-report` said "verified" for such a function and a program with an unanalysed use-after-free across a `goto` back-edge could silently link. Pass `--allow-degraded` to opt back in. `--verify-report` and the success report now also print which function(s) are degraded and why.
+- Struct layout now uses real C ABI alignment padding instead of packing fields with no padding at all. `struct P { char c; int x; long y; }` now sizes as 16 bytes at offsets 0/4/8 (confirmed to match `cc`'s own layout), not 13 bytes at 0/1/5. This was internally consistent for a CCC-only program but wrong the moment such a struct's memory is shared with real C code — the scenario the whole project is working toward. Shared between both emitters via the new `CCC.Syntax.Layout` module. Union sizing is still a known gap (unchanged, tracked separately).
+- `sizeof(expr)` (as opposed to `sizeof(type)`) previously discarded the parsed expression entirely and approximated its size as `sizeof(int)` regardless of what the expression actually was. Now resolves the operand's real inferred type (`long` → 8, `char` → 1, a struct field → its own type's size, etc.) via a new `Expr.sizeOfExpr` AST node. The operand is correctly never evaluated for safety-checking purposes (matching C semantics: `sizeof(*null_ptr)` is well-defined and is not a null-pointer dereference).
+
+### Added
+- `test/StructLayoutTest.lean` (10 cases) for the struct-alignment and `sizeof(expr)` fixes above.
+
 ## [0.2.0] - 2026-09-19
 
 ### Fixed

@@ -179,8 +179,9 @@ lake env lean --run test/Phase2Features.lean       # 37/37 — language features
 lake env lean --run test/PreprocessTest.lean       # 14/14 — preprocessor
 lake env lean --run test/TypedefTest.lean          # 10/10 — typedef resolution
 lake env lean --run test/VerifierAccuracyTest.lean # 10/10 — false-positive guard
-lake env lean --run test/VerifierFixesTest.lean    # 26/26 — verifier soundness/precision regressions
+lake env lean --run test/VerifierFixesTest.lean    # 27/27 — verifier soundness/precision regressions
 lake env lean --run test/HardenTest.lean           #  5/5  — --harden runtime bounds checks
+lake env lean --run test/StructLayoutTest.lean     # 10/10 — struct alignment, sizeof(expr)
 lake env lean --run test/E2EAllDemos.lean          # demo programs
 
 bash test/regression/run_regressions.sh             # numbered CCC-BUG-NNN repros

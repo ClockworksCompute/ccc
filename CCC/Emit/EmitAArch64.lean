@@ -565,6 +565,13 @@ partial def emitArmExpr (env : TypeEnv) (expr : Expr) : ArmCodegenM Unit := do
       let st ← get
       let resolvedTy := resolveType st.typedefs ty
       emitArmInstr (.mov_imm .x0 (Int.ofNat (cTypeSize st.structDefs resolvedTy)))
+  | .sizeOfExpr operand _ =>
+      -- FEL-68: mirrors the x86 emitter's `.sizeOfExpr` case — see its
+      -- comment. The operand is never evaluated, only its inferred type.
+      let st ← get
+      let opTy := inferExprType env st.structDefs operand
+      let resolvedTy := resolveType st.typedefs opTy
+      emitArmInstr (.mov_imm .x0 (Int.ofNat (cTypeSize st.structDefs resolvedTy)))
   | .assign lhs rhs _ =>
       emitArmExpr env rhs
       emitArmPush .x0               -- push rhs value
