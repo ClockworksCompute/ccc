@@ -48,6 +48,60 @@ partial def sizeOfType (ctx : VerifyCtx) (ty : Syntax.CType) : Option Nat :=
   | .volatile_ inner => sizeOfType ctx inner
   | .restrict_ inner => sizeOfType ctx inner
 
+/-- Find a declared/static type for a local variable named `name` in a
+    statement list: recurses into every nested-statement position (both
+    branches of `if`, loop bodies, blocks, switch cases, labels). No VLAs
+    are supported by this compiler, so a local array's DECLARED size is
+    always its real one -- this is exact, not an approximation. -/
+private partial def findVarDeclType (name : String) (stmts : List Syntax.Stmt)
+    : Option Syntax.CType :=
+  match stmts with
+  | [] => none
+  | s :: rest =>
+      let hereOpt : Option Syntax.CType :=
+        match s with
+        | .varDecl n ty _ _ => if n == name then some ty else none
+        | .ifElse _ t e _ =>
+            match findVarDeclType name t with
+            | some ty => some ty
+            | none => findVarDeclType name e
+        | .while_ _ b _ => findVarDeclType name b
+        | .for_ initOpt _ _ b _ =>
+            match initOpt with
+            | some i =>
+                match findVarDeclType name [i] with
+                | some ty => some ty
+                | none => findVarDeclType name b
+            | none => findVarDeclType name b
+        | .block b _ => findVarDeclType name b
+        | .switch_ _ cases _ =>
+            cases.foldl (init := none) (fun acc (_, body, _) =>
+              match acc with
+              | some ty => some ty
+              | none => findVarDeclType name body)
+        | .doWhile b _ _ => findVarDeclType name b
+        | .label_ _ body _ => findVarDeclType name [body]
+        | _ => none
+      match hereOpt with
+      | some ty => some ty
+      | none => findVarDeclType name rest
+
+/-- Declared type of a local variable (parameter or `varDecl`) in the
+    CURRENT function, per `ctx.currentFun`/`ctx.program`. Used only to
+    resolve `sizeof(localVar)` (see `.sizeOfExpr` below) -- deliberately
+    narrow: a bare variable name is by far the common real-world shape
+    (`malloc(sizeof(buf))`), and reaching for the general case (a field
+    access, a dereference, ...) would need the same live `exprType?` this
+    file is imported BY (`BoundsCheck.lean`), which would be a circular
+    import from here. -/
+private def declaredTypeOfLocal? (ctx : VerifyCtx) (name : String) : Option Syntax.CType :=
+  match ctx.program.functions.find? (·.name == ctx.currentFun) with
+  | none => none
+  | some fn =>
+      match fn.params.find? (·.name == name) with
+      | some p => some p.ty
+      | none => findVarDeclType name fn.body
+
 /-- Resolve a compile-time signed-integer expression. Like `resolveExprNat`
     but keeps the sign, so `-5`, `w - h`, and unary negation resolve
     correctly instead of collapsing to `none`. Used by the range/bounds
@@ -57,6 +111,16 @@ partial def resolveExprInt (ctx : VerifyCtx) (expr : Syntax.Expr) : Option Int :
   | .intLit v _ => some v
   | .charLit c _ => some (Int.ofNat c.toNat)
   | .sizeOf ty _ => (sizeOfType ctx ty).map Int.ofNat
+  -- FEL-49 item 5 correction: `sizeof(localVar)` (as opposed to
+  -- `sizeof(type)`, the `.sizeOf` case above) used to be unresolvable
+  -- here at all -- `malloc(sizeof(buf))` then had an UNKNOWN capacity,
+  -- silently skipping bounds-checking on every access through the
+  -- result, exactly the "unknown size -> silent pass" shape FEL-45 fixed
+  -- for memcpy-family sinks. See `declaredTypeOfLocal?`'s docstring for
+  -- why only a bare variable operand is handled.
+  | .sizeOfExpr (.var name _) _ =>
+      (declaredTypeOfLocal? ctx name).bind (fun ty => (sizeOfType ctx ty).map Int.ofNat)
+  | .sizeOfExpr _ _ => none
   | .unOp .neg operand _ => (resolveExprInt ctx operand).map (fun v => -v)
   | .binOp op lhs rhs _ =>
       match resolveExprInt ctx lhs, resolveExprInt ctx rhs with
@@ -78,6 +142,8 @@ partial def resolveExprNat (ctx : VerifyCtx) (expr : Syntax.Expr) : Option Nat :
   | .intLit v _ =>
       if v < 0 then none else some v.toNat
   | .sizeOf ty _ => sizeOfType ctx ty
+  | .sizeOfExpr (.var name _) _ => (declaredTypeOfLocal? ctx name).bind (sizeOfType ctx)
+  | .sizeOfExpr _ _ => none
   | .binOp op lhs rhs _ =>
       match resolveExprNat ctx lhs, resolveExprNat ctx rhs with
       | some a, some b =>

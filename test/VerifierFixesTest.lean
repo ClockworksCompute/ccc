@@ -685,6 +685,44 @@ def main : IO UInt32 := do
     "int main() {\n  char buf[64] = \"hello\";\n  strncat(buf, \" world\", 6);\n  return 0;\n}"
   then pass := pass + 1
 
+  -- FEL-49 item 5 correction: `sizeof(localArrayVar)` (as opposed to
+  -- `sizeof(type)`) previously resolved to `none` everywhere that matters
+  -- for bounds-checking, so `malloc(sizeof(buf))` had an UNKNOWN capacity
+  -- and every access through the result silently skipped bounds-checking
+  -- entirely -- confirmed a genuine, previously-undetected heap overflow
+  -- with `cc -fsanitize=address` before this fix. Out-of-bounds access
+  -- through such a pointer must now be caught with the CORRECT capacity
+  -- (100, from `sizeof(big)`), not silently passed.
+  total := total + 1
+  if ← expectCaught "FEL49_sizeof_local_array_malloc_capacity_out_of_bounds"
+    ("typedef unsigned long size_t;\n" ++
+     "void *malloc(size_t sz);\n" ++
+     "int main() {\n" ++
+     "  char big[100];\n" ++
+     "  char *p = malloc(sizeof(big));\n" ++
+     "  if (!p) { return 1; }\n" ++
+     "  p[150] = 1;\n" ++
+     "  return 0;\n" ++
+     "}\n")
+  then pass := pass + 1
+
+  -- Regression guard / precision check: the same shape but genuinely
+  -- in-bounds must remain clean -- confirms the resolved capacity is
+  -- exactly 100 (sizeof(big)), not some other value that would coincide
+  -- with rejecting this access too.
+  total := total + 1
+  if ← expectClean "FEL49_sizeof_local_array_malloc_capacity_in_bounds"
+    ("typedef unsigned long size_t;\n" ++
+     "void *malloc(size_t sz);\n" ++
+     "int main() {\n" ++
+     "  char big[100];\n" ++
+     "  char *p = malloc(sizeof(big));\n" ++
+     "  if (!p) { return 1; }\n" ++
+     "  p[50] = 1;\n" ++
+     "  return 0;\n" ++
+     "}\n")
+  then pass := pass + 1
+
   IO.println s!"\n═══ Results: {pass}/{total} passed ═══"
   if pass == total then
     IO.println "All verifier-fixes regression tests passed!"
