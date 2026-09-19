@@ -54,6 +54,24 @@ def locToJson (loc : Loc) : Json :=
   let col : Nat := loc.col
   Json.mkObj [("line", line), ("col", col)]
 
+/-- FEL-70 (first slice): the structured facts behind a violation, when
+    the checker that found it populated one (see `Syntax.Witness`'s own
+    docstring for exactly which violation kinds do so today). `kind` is a
+    stable machine-readable tag; the remaining fields are only present
+    when that `kind` uses them, so a consumer can match on `kind` first. -/
+def witnessToJson : Witness → Json
+  | .boundsExceeds capacity requiredLessThan =>
+      let cap : Nat := capacity
+      let req : Int := requiredLessThan
+      Json.mkObj [("kind", Json.str "boundsExceeds"), ("capacity", cap), ("requiredLessThan", req)]
+  | .boundsUnknownIndex capacity =>
+      let cap : Nat := capacity
+      Json.mkObj [("kind", Json.str "boundsUnknownIndex"), ("capacity", cap)]
+  | .boundsNegativeIndex =>
+      Json.mkObj [("kind", Json.str "boundsNegativeIndex")]
+  | .divByZeroUnproven opName =>
+      Json.mkObj [("kind", Json.str "divByZeroUnproven"), ("op", Json.str opName)]
+
 def violationToJson (v : SafetyViolation) : Json :=
   Json.mkObj [
     ("property", Json.str (ruleIdOf v.property)),
@@ -63,6 +81,9 @@ def violationToJson (v : SafetyViolation) : Json :=
     ("context", Json.arr (v.context.map Json.str).toArray),
     ("suggestion", match v.suggestion with
       | some s => Json.str s
+      | none => Json.null),
+    ("witness", match v.witness with
+      | some w => witnessToJson w
       | none => Json.null)
   ]
 

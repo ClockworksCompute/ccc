@@ -189,7 +189,7 @@ lake env lean --run test/StackArgsTest.lean        #  6/6  — AAPCS64 stack arg
 lake env lean --run test/GlobalArrayTest.lean      # 10/10 — global array declarations/initializers
 lake env lean --run test/EnumResolveTest.lean      # 11/11 — enum constant resolution
 lake env lean --run test/FuncPtrTest.lean          # 10/10 — function pointers / indirect calls
-lake env lean --run test/JsonReportTest.lean       #  5/5  — --report=json structured output
+lake env lean --run test/JsonReportTest.lean       #  8/8  — --report=json structured output
 lake env lean --run test/E2EAllDemos.lean          # demo programs
 
 bash test/regression/run_regressions.sh             # numbered CCC-BUG-NNN repros

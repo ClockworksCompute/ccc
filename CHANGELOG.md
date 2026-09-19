@@ -12,6 +12,7 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 - 7 new cases in `test/VerifierFixesTest.lean` (now 38) for the two fixes above, including a regression guard confirming a literal-bounded loop still verifies clean, and an adversarial pair distinguishing an explicitly-widened sum (trusted) from the identical narrow-arithmetic shape (correctly still rejected).
+- `SafetyViolation` gains an optional structured `witness` field (a real `capacity`/`requiredLessThan`/`op` value, not just prose embedded in `message`) for buffer-bounds and div-by-zero violations, exposed as a `witness` object in `--report=json` — first slice of the structured-report work; other violation properties still carry `witness: null`, same as before. 3 new cases in `test/JsonReportTest.lean` (now 8).
 
 ## [0.3.0] - 2026-09-19
 

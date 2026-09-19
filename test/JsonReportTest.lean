@@ -110,6 +110,61 @@ def main : IO UInt32 := do
     else
       IO.eprintln s!"✗ json_exempt_function: exit {code}, output: {out}"
 
+  -- FEL-70 (first slice): a violation the checker recognized as
+  -- "capacity known, but the proven index bound exceeds it" must carry
+  -- a structured `witness` object with the exact capacity and bound as
+  -- real numbers, not just embedded in the prose `message` string.
+  total := total + 1
+  do
+    let path ← writeTmp "witness_exceeds"
+      ("void fill(int arr[10], int n) {\n" ++
+       "  int i;\n" ++
+       "  for (i = 0; i < n && i < 20; i = i + 1) { arr[i] = i; }\n" ++
+       "}\n" ++
+       "int main() { int arr[10]; fill(arr, 20); return arr[0]; }\n")
+    let (_, out) ← ccJson #["--report=json", path]
+    let ok := containsStr out "\"kind\":\"boundsExceeds\"" &&
+      containsStr out "\"capacity\":10" && containsStr out "\"requiredLessThan\":20"
+    if ok then
+      IO.println "✓ json_witness_bounds_exceeds: kind/capacity/requiredLessThan present and correct"
+      pass := pass + 1
+    else
+      IO.eprintln s!"✗ json_witness_bounds_exceeds: output: {out}"
+
+  -- The FEL-76 shape (capacity known, index bound UNPROVABLE at all)
+  -- must carry the "boundsUnknownIndex" witness kind with the capacity,
+  -- distinct from "boundsExceeds" above.
+  total := total + 1
+  do
+    let path ← writeTmp "witness_unknown"
+      ("void fill(int arr[10], int n) {\n" ++
+       "  int i;\n" ++
+       "  for (i = 0; i < n; i = i + 1) { arr[i] = i; }\n" ++
+       "}\n" ++
+       "int main() { int arr[10]; fill(arr, 20); return arr[0]; }\n")
+    let (_, out) ← ccJson #["--report=json", path]
+    let ok := containsStr out "\"kind\":\"boundsUnknownIndex\"" && containsStr out "\"capacity\":10"
+    if ok then
+      IO.println "✓ json_witness_bounds_unknown_index: kind/capacity present and correct"
+      pass := pass + 1
+    else
+      IO.eprintln s!"✗ json_witness_bounds_unknown_index: output: {out}"
+
+  -- A div-by-zero violation must carry a "divByZeroUnproven" witness
+  -- naming the operation.
+  total := total + 1
+  do
+    let path ← writeTmp "witness_divzero"
+      ("int check(int n) {\n  return 100 / n;\n}\n" ++
+       "int main() { return check(5); }\n")
+    let (_, out) ← ccJson #["--report=json", path]
+    let ok := containsStr out "\"kind\":\"divByZeroUnproven\"" && containsStr out "\"op\":\"division\""
+    if ok then
+      IO.println "✓ json_witness_div_by_zero: kind/op present and correct"
+      pass := pass + 1
+    else
+      IO.eprintln s!"✗ json_witness_div_by_zero: output: {out}"
+
   IO.println ""
   IO.println "═══════════════════════════════════════════"
   IO.println s!"  JSON report tests: {pass}/{total} passed"

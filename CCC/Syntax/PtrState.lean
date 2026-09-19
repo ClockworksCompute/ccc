@@ -71,6 +71,37 @@ inductive SafetyProperty where
   | noDivByZero      -- CWE-369: division or modulo by a value that may be zero
   deriving Repr, Inhabited, BEq, DecidableEq
 
+/-- FEL-70 (first slice): structured facts behind a violation, so a
+    consumer (`--report=json`, an eventual `--suggest-fix` patch-synthesis
+    loop, IDE tooling) doesn't have to parse them back out of prose —
+    `SafetyViolation.message` is a formatted-for-humans string that
+    happens to CONTAIN this information today (e.g. "capacity=10,
+    required<20"), not a place a machine can reliably extract exact
+    values from. Only `bufferBounds` and `noDivByZero` violations carry
+    one so far (the two properties this session's FEL-76/FEL-77 fixes
+    concretely reasoned about); every other property, and any
+    `bufferBounds`/`noDivByZero` case not listed below, still gets
+    `none` — the prose `message` remains the only detail for those,
+    exactly as before. Extending coverage to every property is real
+    remaining work, not attempted here. -/
+inductive Witness where
+  /-- A dynamic index that COULD be proven within bounds, but the proven
+      upper bound (`requiredLessThan`, exclusive) exceeds the array's own
+      `capacity` — e.g. `arr[i]` where `i` is known `< 20` but `arr` only
+      holds 10 elements. -/
+  | boundsExceeds (capacity : Nat) (requiredLessThan : Int)
+  /-- A dynamic index whose upper bound could not be established at all
+      (e.g. a loop bounded by an ordinary, unrelated parameter) — the
+      shape FEL-76 fixed the false-negative for. -/
+  | boundsUnknownIndex (capacity : Nat)
+  /-- An index that could not be shown non-negative. -/
+  | boundsNegativeIndex
+  /-- A division/modulo whose divisor could not be shown nonzero — the
+      shape FEL-77 fixed the false-positive for (when it CAN now be
+      shown, via a widened-arithmetic provably-nonzero sum). -/
+  | divByZeroUnproven (opName : String)
+  deriving Repr, Inhabited, BEq
+
 /-- A single safety violation found by the verifier. -/
 structure SafetyViolation where
   property   : SafetyProperty
@@ -79,6 +110,7 @@ structure SafetyViolation where
   message    : String          -- human-readable description
   context    : List String     -- additional context lines
   suggestion : Option String   -- suggested fix, if applicable
+  witness    : Option Witness := none  -- FEL-70: structured facts, first slice (see `Witness`)
   deriving Repr, Inhabited
 
 /-- Evidence that a specific safety property holds. -/

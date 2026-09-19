@@ -50,13 +50,14 @@ private def isUnsignedTy (ty : Syntax.CType) : Bool :=
   | _ => false
 
 private def mkBoundsViolation (ctx : VerifyCtx) (loc : Syntax.Loc) (expr : Syntax.Expr)
-    (message : String) : Syntax.SafetyViolation :=
+    (message : String) (witness : Option Syntax.Witness := none) : Syntax.SafetyViolation :=
   { property := .bufferBounds
     loc := loc
     expr := reprStr expr
     message := message
     context := [s!"function: {ctx.currentFun}"]
-    suggestion := some "Add or strengthen bounds checks before this access" }
+    suggestion := some "Add or strengthen bounds checks before this access"
+    witness := witness }
 
 private def mkBufSinkViolation (ctx : VerifyCtx) (loc : Syntax.Loc) (expr : Syntax.Expr)
     (fnName : String) (message : String) (suggestion : String) : Syntax.SafetyViolation :=
@@ -74,7 +75,8 @@ private def mkDivByZeroViolation (ctx : VerifyCtx) (loc : Syntax.Loc) (expr : Sy
     expr := reprStr expr
     message := s!"Cannot verify the {opName} divisor is nonzero"
     context := [s!"function: {ctx.currentFun}"]
-    suggestion := some "Guard with an explicit `!= 0` check, or prove it via a literal/shift-of-nonzero divisor" }
+    suggestion := some "Guard with an explicit `!= 0` check, or prove it via a literal/shift-of-nonzero divisor"
+    witness := some (.divByZeroUnproven opName) }
 
 /-- Is `rhs` (a division/modulo divisor) provably nonzero? A literal
     resolves directly; `1 << x`-shaped expressions (the extremely common
@@ -326,7 +328,8 @@ private def checkIndexAccess (ctx : VerifyCtx) (arr idx fullExpr : Syntax.Expr)
       if !(idxLoOk ctx state idx r) then
         state.addViolation
           (mkBoundsViolation ctx loc fullExpr
-            "Index may be negative (cannot verify a non-negative lower bound)")
+            "Index may be negative (cannot verify a non-negative lower bound)"
+            (some .boundsNegativeIndex))
       else
         match r.hi with
         | some idxBoundExclusive =>
@@ -341,11 +344,13 @@ private def checkIndexAccess (ctx : VerifyCtx) (arr idx fullExpr : Syntax.Expr)
             else
               state.addViolation
                 (mkBoundsViolation ctx loc fullExpr
-                  s!"Index may exceed array bounds (capacity={cap}, required<{idxBoundExclusive})")
+                  s!"Index may exceed array bounds (capacity={cap}, required<{idxBoundExclusive})"
+                  (some (.boundsExceeds cap idxBoundExclusive)))
         | none =>
             state.addViolation
               (mkBoundsViolation ctx loc fullExpr
-                "Cannot verify dynamic index is within bounds")
+                "Cannot verify dynamic index is within bounds"
+                (some (.boundsUnknownIndex cap)))
 
 -- ══════════════════════════════════════════════════════════════
 -- Known-sink table (FEL-45): memcpy/memmove/memset/strncpy/snprintf checked
