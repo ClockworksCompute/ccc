@@ -1,5 +1,80 @@
 # CVE regression corpus — baseline results
 
+## 2026-09-19 (fourth update) — libheif-overlay-85e21ad DEMOTED back to
+## false-positive: the "detected" mechanism was unsound (FEL-64)
+
+**Against commit:** `50a7922` plus the changes made directly after it on
+`epic/libheif-class-detection` (FEL-64/FEL-66).
+
+The third update below reported `libheif-overlay-85e21ad` as **detected**
+via a scoped relational mechanism (`CCC/Verify/Canon.lean`,
+`Verify.clipPostcondition`, `BoundsCheck.check2DIndex`). A follow-up
+review of that mechanism found it unsound: it reasons over unbounded
+integers (ℤ), strips every cast when comparing expressions, and infers a
+pointer parameter's capacity from a single call site by variable name
+with no per-call-site check. Six one-to-three-line mutations of
+`fixed.c` — each independently confirmed to heap-buffer-overflow under
+`cc -fsanitize=address` — were all still **accepted with 0 violations**
+by that mechanism:
+
+| mutation | why it overflows |
+| --- | --- |
+| loop bound `col <= in_w` instead of `<`, `dx = 4` | off-by-one: last column writes index `out_w` |
+| both `dx` complete-miss guards removed, `dx = 30` | `in_w = out_w - dx` wraps (`uint32_t`) instead of being caught |
+| `(uint8_t)dx` truncating cast in the right-border clip | clip computes 356 instead of the correct 100 |
+| second call site passing a 4-byte destination buffer | capacity inferred from a *different* call site's larger buffer |
+| `out_w` doubled between `malloc(out_w*out_h)` and the call | allocation is stale; capacity table matches by name, not value |
+| only the left guard removed, `dx = -20`, `in_w = 16` | `in_w = in_w - in_x0` wraps as unsigned subtraction |
+
+These are checked in as
+[`test/corpus/libheif-overlay-85e21ad/must-reject/`](../test/corpus/libheif-overlay-85e21ad/must-reject/),
+one file per row above, each with a header comment explaining the exact
+mutation and the ASan confirmation. `scripts/corpus.sh` now treats an
+entry as `detected` only if it also rejects every file under its own
+`must-reject/` directory; if a would-be-detected entry fails one, the
+scoreboard reports it as `false-positive` with a note naming the file
+(`UNSOUND: must-reject/NNN.c was accepted (FEL-64)`) instead of silently
+letting the pair-only check call it good.
+
+Rather than ship a mechanism known to fail on six near-neighbors of the
+one file it was built against, `check2DIndex` was changed to always
+report "cannot verify" for the pattern it recognizes (see its docstring
+in `CCC/Verify/BoundsCheck.lean`) — it still names the idiom and which
+axis looked unprovable even heuristically, as a diagnostic, but it no
+longer turns that heuristic into an accept. This is a **pure
+precision regression, not a soundness regression**: nothing that was
+previously and correctly rejected is now accepted; `fixed.c` (previously
+wrongly accepted by the unsound path) is now correctly reported as
+unprovable, same as before the third update below.
+
+**Current scoreboard** (re-measured just now):
+
+```
+ENTRY                              VULN        FIXED       CLASS            NOTES
+--------------------------------------------------------------------------------------------
+libheif-overlay-85e21ad            rejected    rejected    false-positive   fixed.c flagged at line 108
+libpng-cve-2015-8126               rejected    rejected    false-positive   fixed.c flagged at line 52
+libpng-cve-2018-13785              rejected    rejected    false-positive   fixed.c flagged at line 26
+libwebp-cve-2023-4863              accepted    accepted    missed           bug not flagged
+--------------------------------------------------------------------------------------------
+
+SUMMARY: 4 entries -- detected=0 missed=1 false-positive=3 parse-failed=0 timeout=0
+```
+
+**This is the honest number.** Closing the libheif entry for real needs
+the work the third update's own "still a real, honest limitation" section
+already named: a sound integer interval/overflow domain (FEL-56), a real
+`(base, offset)` pointer model (FEL-57), and per-call-site interprocedural
+capacity checks (FEL-58) — tracked under the top-level epic FEL-65 and its
+sub-epic FEL-54. The must-reject convention introduced here stays in
+place permanently: any future mechanism that flips this entry to
+`detected` must clear all six mutants (and any new ones added later) or
+the scoreboard will correctly call it unsound again.
+
+---
+
+# CVE regression corpus — baseline results
+
 ## 2026-09-19 (third update) — libheif-overlay-85e21ad: DETECTED (epic FEL-54
 ## DoD bullet 1 satisfied)
 

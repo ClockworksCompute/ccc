@@ -114,6 +114,7 @@ n_missed=0
 n_false_positive=0
 n_parse_failed=0
 n_timeout=0
+n_unsound=0
 
 printf '%-34s %-11s %-11s %-16s %s\n' "ENTRY" "VULN" "FIXED" "CLASS" "NOTES"
 printf -- '--------------------------------------------------------------------------------------------\n'
@@ -151,9 +152,39 @@ for entry_dir in "$CORPUS_DIR"/*/; do
         n_missed=$((n_missed + 1))
         notes="bug not flagged"
     elif [ "$vuln_verdict" = "rejected" ] && [ "$fixed_verdict" = "accepted" ]; then
-        class="detected"
-        n_detected=$((n_detected + 1))
-        notes="violation at line $vuln_line"
+        # Provisionally "detected" on the vulnerable/fixed pair alone -- but
+        # that pair is a single data point. FEL-64: a mechanism can reject
+        # vulnerable.c and accept fixed.c for reasons that have nothing to
+        # do with soundly modelling the bug, and still accept a handful of
+        # one-line mutants of fixed.c that reintroduce the exact same class
+        # of overflow. So a "detected" verdict is only trustworthy once
+        # every file under this entry's must-reject/ directory (variants
+        # that are KNOWN, ASan-confirmed, to overflow) is also rejected.
+        must_reject_dir="$entry_dir/must-reject"
+        unsound_file=""
+        if [ -d "$must_reject_dir" ]; then
+            for mr_file in "$must_reject_dir"/*.c; do
+                [ -f "$mr_file" ] || continue
+                run_ccc "$mr_file"
+                if [ "$RC_VERDICT" != "rejected" ]; then
+                    unsound_file="$(basename "$mr_file")"
+                    break
+                fi
+            done
+        fi
+        if [ -n "$unsound_file" ]; then
+            class="false-positive"
+            n_false_positive=$((n_false_positive + 1))
+            n_unsound=$((n_unsound + 1))
+            notes="UNSOUND: must-reject/$unsound_file was accepted (FEL-64)"
+        else
+            class="detected"
+            n_detected=$((n_detected + 1))
+            notes="violation at line $vuln_line"
+            if [ -d "$must_reject_dir" ]; then
+                notes="$notes; must-reject/ variants all rejected"
+            fi
+        fi
     else
         # vuln rejected, fixed also rejected
         class="false-positive"
@@ -166,12 +197,16 @@ done
 
 printf -- '--------------------------------------------------------------------------------------------\n'
 echo
-echo "SUMMARY: $n_total entries -- detected=$n_detected missed=$n_missed false-positive=$n_false_positive parse-failed=$n_parse_failed timeout=$n_timeout"
+echo "SUMMARY: $n_total entries -- detected=$n_detected missed=$n_missed false-positive=$n_false_positive parse-failed=$n_parse_failed timeout=$n_timeout (of which unsound-detected=$n_unsound: rejected the vuln/fixed pair but accepted a known-bad must-reject/ mutant, see FEL-64)"
 
 if [ "$n_detected" -eq "$n_total" ] && [ "$n_total" -gt 0 ]; then
     echo "PASS: all $n_total corpus entries detected"
 else
     echo "FAIL: $((n_total - n_detected))/$n_total corpus entries not detected (see table above) -- expected while the verifier lacks integer-overflow/pointer-arithmetic tracking (FEL-42..48); this script is a scoreboard, not a gate, and always exits 0"
+fi
+
+if [ "$n_unsound" -gt 0 ]; then
+    echo "NOTE: $n_unsound entr$([ "$n_unsound" -eq 1 ] && echo y || echo ies) would have scored 'detected' on the vuln/fixed pair alone but failed a must-reject/ mutant -- see FEL-64. Reported as false-positive above, which is the honest, conservative call."
 fi
 
 exit 0

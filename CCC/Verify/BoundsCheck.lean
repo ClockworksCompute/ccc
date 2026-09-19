@@ -240,21 +240,27 @@ private partial def proveSumLE (ctx : VerifyCtx) (state : FlowState)
       | none => false
   go (canon ctx.program xExpr) fuel
 
-/-- FEL-54/56/57/58 (libheif-class detection, epic DoD bullet 1): when the
-    ordinary capacity check above can't even resolve a capacity for `arr`
-    (a bare pointer parameter, not an array with a known static size), try
-    the one additional pattern this epic targets: `arr` is a parameter
-    whose (width, height) capacity was inferred interprocedurally
-    (`VerifyCtx.capacityParamsAt`, from `Verify.buildParamCapacityTable`'s
-    whole-program malloc-call-site scan), and `idx` is a flattened 2-D
-    index whose stride matches the inferred width. If both the row and
-    column offsets can be proven (`proveSumLE`) to stay under their
-    respective bound, the access is accepted; if the pattern matches this
-    far but a bound can't be proven, that's a real violation (the sound
-    default for a recognized-but-unproven 2-D access) rather than silence.
-    Scoped deliberately narrowly (stride must match the inferred width
-    exactly) so this can't become a new false-positive source for
-    ordinary pointer indexing that doesn't match this idiom at all. -/
+/-- FEL-54/56/57/58 (libheif-class detection, epic DoD bullet 1) — pattern
+    RECOGNITION only, never ACCEPTANCE. See FEL-64: the `proveSumLE`/`canon`
+    machinery this used to accept access on reasons over unbounded integers
+    (ℤ), stripping every cast and never modelling wraparound, truncation, or
+    per-call-site capacity mismatches. Six one-to-three-line mutations of a
+    program this mechanism accepted were confirmed with AddressSanitizer to
+    still heap-overflow while it reported 0 violations (off-by-one loop
+    bound, removed overflow guards, a truncating cast in a clip, a second
+    call site with a smaller buffer, a capacity mutated between allocation
+    and use, an unsigned-subtraction wrap) — see FEL-64's table for the
+    full list. So this now ALWAYS reports "cannot verify" for the pattern
+    it recognizes (a parameter whose (width, height) capacity was inferred
+    interprocedurally via `VerifyCtx.capacityParamsAt`, indexed by a
+    flattened 2-D expression whose stride matches the inferred width) —
+    `colOk`/`rowOk` are still computed and reported in the message as a
+    diagnostic hint (they tell you WHICH axis the heuristic could not close
+    even provisionally), but they never flip this into an accept. Do not
+    make this accept again without a sound interval/overflow domain
+    (FEL-56) and a real per-call-site capacity check (FEL-58) underneath
+    it — a false "equal" or a false "bounded" here is a silent, unsound
+    accept, exactly the shape FEL-64 exploited. -/
 private def check2DIndex (ctx : VerifyCtx) (arr idx fullExpr : Syntax.Expr) (loc : Syntax.Loc)
     (state : FlowState) : Option FlowState :=
   match arr with
@@ -270,25 +276,21 @@ private def check2DIndex (ctx : VerifyCtx) (arr idx fullExpr : Syntax.Expr) (loc
               | some (rowOffset, rowVar, strideExpr, colOffset, colVar) =>
                   if canon ctx.program strideExpr != widthKey then none
                   else
-                    -- Try both the plain capacity-parameter key AND its
-                    -- function-entry marker (`Verify.initFlowStateFromParams`):
-                    -- a parameter that's never reassigned (like libheif's
-                    -- out_w/out_h) is proven via the plain key; one that IS
-                    -- reassigned before this access (like in_w/in_h, shrunk
-                    -- by the border clip) needs the entry marker, since the
-                    -- CALLER's original argument — not whatever the
-                    -- parameter holds by now — is what actually bounds the
-                    -- allocation.
+                    -- Diagnostic only (see the docstring above) — NOT used
+                    -- to accept the access.
                     let colOk := proveSumLE ctx state colOffset colVar widthKey 4 ||
                                  proveSumLE ctx state colOffset colVar ("@" ++ widthKey) 4
                     let rowOk := proveSumLE ctx state rowOffset rowVar heightKey 4 ||
                                  proveSumLE ctx state rowOffset rowVar ("@" ++ heightKey) 4
-                    if colOk && rowOk then
-                      some (state.addEvidence (.dynamicBoundsChecked (exprName arr) loc))
-                    else
-                      some (state.addViolation
-                        (mkBoundsViolation ctx loc fullExpr
-                          s!"Cannot verify flattened 2-D index stays within the inferred capacity ({widthKey}×{heightKey}) of parameter '{arrName}'"))
+                    let axisHint :=
+                      if colOk && rowOk then
+                        " (a heuristic pass over unbounded-integer arithmetic could not rule out overflow/wraparound in this idiom — FEL-64)"
+                      else if colOk then " (row offset unproven even heuristically)"
+                      else if rowOk then " (column offset unproven even heuristically)"
+                      else " (neither axis proven, even heuristically)"
+                    some (state.addViolation
+                      (mkBoundsViolation ctx loc fullExpr
+                        s!"Cannot verify flattened 2-D index stays within the inferred capacity ({widthKey}×{heightKey}) of parameter '{arrName}'{axisHint}"))
   | _ => none
 
 private def checkIndexAccess (ctx : VerifyCtx) (arr idx fullExpr : Syntax.Expr)

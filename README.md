@@ -149,9 +149,16 @@ suites:
 - **Preprocessor:** `#include`, `#define`/`#undef`, `#ifdef`/`#ifndef`/`#if`,
   include guards
 
-**Not yet supported:** `union` types, `float`/`double` arithmetic, variadic
-functions, and function pointers are parsed but will panic at codegen. This is
-a proof-of-concept — the test suites define the validated surface.
+**Not yet supported:** `union` types are parsed but sized as 0 bytes.
+`float`/`double` arithmetic parses and emits, but every float literal and
+operation currently computes as `0` — this does not panic, it silently
+produces the wrong answer, so don't rely on floating point yet. Variadic
+functions and function pointers have partial codegen support (see
+`test/AArch64Test.lean` for what's exercised) but are not fully verified.
+Struct layout has no alignment padding, and calls with more than 8
+arguments fail to emit. This is a proof-of-concept — the test suites
+define the validated surface, and the gaps above are tracked as the
+"emitter completeness" work in the project's Linear tracker.
 
 ## Backend
 
@@ -172,7 +179,13 @@ lake env lean --run test/Phase2Features.lean       # 37/37 — language features
 lake env lean --run test/PreprocessTest.lean       # 14/14 — preprocessor
 lake env lean --run test/TypedefTest.lean          # 10/10 — typedef resolution
 lake env lean --run test/VerifierAccuracyTest.lean # 10/10 — false-positive guard
+lake env lean --run test/VerifierFixesTest.lean    # 22/22 — verifier soundness/precision regressions
+lake env lean --run test/HardenTest.lean           #  5/5  — --harden runtime bounds checks
 lake env lean --run test/E2EAllDemos.lean          # demo programs
+
+bash test/regression/run_regressions.sh             # numbered CCC-BUG-NNN repros
+bash test/run_demos.sh                               # gate script: 7 demos, verify accept/reject
+scripts/corpus.sh                                    # CVE corpus scoreboard (see below)
 ```
 
 ### CVE corpus
@@ -193,16 +206,27 @@ scripts/corpus.sh
 ```
 
 Baseline status (see [`docs/corpus-results.md`](./docs/corpus-results.md)
-for the full writeup): **0 of 4 entries detected.** Two (`libheif-overlay-85e21ad`,
-`libpng-cve-2018-13785`) are **missed** — `ccc` accepts the vulnerable
-version outright, since the verifier does not yet track integer overflow
-or treat computed pointer/array offsets as anything but unchecked. The
-other two (`libpng-cve-2015-8126`, `libwebp-cve-2023-4863`) are
-**false-positive** — `ccc` rejects the vulnerable version, but rejects the
-fixed version identically, unable to relate a runtime clamp/bounds check
-to the buffer it protects. This is not a typo or an oversight — the
+for the full writeup): **0 of 4 entries detected.** `libwebp-cve-2023-4863`
+is **missed** — `ccc` accepts the vulnerable version outright, since the
+verifier does not yet track integer overflow. The other three
+(`libheif-overlay-85e21ad`, `libpng-cve-2015-8126`, `libpng-cve-2018-13785`)
+are **false-positive** — `ccc` rejects the vulnerable version, but rejects
+the fixed version identically, unable to relate a runtime clamp/bounds
+check to the buffer it protects. This is not a typo or an oversight — the
 corpus exists precisely to make that number improve (or regress)
 measurably as the verifier changes, not to claim it's already good.
+
+An earlier version of this scoreboard briefly showed `libheif-overlay-85e21ad`
+as "detected", via a scoped heuristic that reasoned over unbounded
+integers. Six one-to-three-line mutations of the fixed source that
+reintroduce a real, AddressSanitizer-confirmed heap overflow were all
+still accepted by that heuristic with 0 violations, so it was removed
+rather than shipped as a false sense of soundness — see
+`test/corpus/libheif-overlay-85e21ad/must-reject/` for those mutants
+(every corpus entry marked "detected" must also reject everything under
+its own `must-reject/` directory, which `scripts/corpus.sh` now checks)
+and the "libheif overlay" write-up in `docs/corpus-results.md` for the
+full account.
 
 ## Project structure
 

@@ -19,16 +19,17 @@ def usage : String :=
   "  --harden: EXPERIMENTAL (FEL-59, in progress). Emit a binary even when\n" ++
   "    the verifier finds violations it cannot clear, with a loud warning\n" ++
   "    naming exactly what was not proven. Exit code stays 0. As of this\n" ++
-  "    build, every array/pointer subscript through a pointer-typed base\n" ++
-  "    (a heap allocation or a parameter — anything whose size isn't known\n" ++
-  "    at compile time) gets a REAL runtime bounds check against a size\n" ++
-  "    registry populated by ccc_malloc, and aborts instead of corrupting\n" ++
-  "    memory on an out-of-bounds or negative index. NOT yet covered:\n" ++
-  "    struct field arrow/dot access, bare pointer dereference (`*p`), and\n" ++
-  "    any allocation the registry didn't see (a full table, or a pointer\n" ++
-  "    from something other than malloc/calloc). Those stay exactly as\n" ++
-  "    unprotected as without --harden. Do not treat this as a complete\n" ++
-  "    hardening mode yet.\n" ++
+  "    build, every `base[index]` subscript through a pointer-typed base\n" ++
+  "    (a heap allocation or a parameter) gets a runtime bounds check,\n" ++
+  "    against a size registry populated by ccc_malloc/ccc_calloc, and\n" ++
+  "    aborts instead of corrupting memory when it fires. That check only\n" ++
+  "    protects an access whose base is exactly a tracked allocation's own\n" ++
+  "    pointer VALUE — the registry does an exact-address match, so ANY\n" ++
+  "    pointer arithmetic in between (`row = p + y*stride; row[x]`) yields\n" ++
+  "    an untracked address and the check silently no-ops for it. Also NOT\n" ++
+  "    covered at all: struct field arrow/dot access, and bare pointer\n" ++
+  "    dereference (`*p`). All of those stay exactly as unprotected as\n" ++
+  "    without --harden. Do not treat this as a complete hardening mode.\n" ++
   "  If no -o specified, only verify (no assembly/linking)."
 
 /-- Find the runtime source file relative to the executable. -/
@@ -138,10 +139,14 @@ def main (args : List String) : IO UInt32 := do
   if harden && !result.violations.isEmpty then
     IO.println ""
     IO.println "⚠️  --harden: emitting despite unproven access(es) above."
-    IO.println "⚠️  No runtime checks were inserted for them (FEL-59 is not"
-    IO.println "⚠️  finished) — this binary can still misbehave exactly like"
-    IO.println "⚠️  an unverified C program on the inputs those violations"
-    IO.println "⚠️  named. Do not treat this as a safe binary."
+    IO.println "⚠️  Index subscripts through a base that is exactly a tracked"
+    IO.println "⚠️  malloc/calloc pointer VALUE get a real runtime bounds"
+    IO.println "⚠️  check and will abort rather than corrupt memory. Everything"
+    IO.println "⚠️  else — pointer arithmetic before the subscript, struct"
+    IO.println "⚠️  field access, bare `*p` dereference, or a base the"
+    IO.println "⚠️  registry never saw — is NOT checked (FEL-59 is not"
+    IO.println "⚠️  finished) and can still misbehave exactly like an"
+    IO.println "⚠️  unverified C program. Do not treat this as a safe binary."
 
   -- FEL-40: `CCC.compile` never produces assembly for a program with
   -- violations (parse error, verification failure, or emission error all
