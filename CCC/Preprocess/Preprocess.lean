@@ -580,7 +580,15 @@ where
                   pure (st.emit s!"/* CCC: skipped #include {rest} */")
           pure { result with includeDepth := st.includeDepth - 1 }
       else if directive.startsWith "error" then
-        pure (st.emit s!"/* CCC #error: {stripWS (dropN directive 5)} */")
+        -- FEL-52: this used to become a harmless comment, so a file that
+        -- hits `#error` (e.g. an unsupported-configuration guard real
+        -- headers use constantly) "preprocessed" successfully and the
+        -- verifier happily reported on whatever nonsense followed it --
+        -- exactly the "silently continue past something that should have
+        -- stopped compilation" shape the parse-skip-tracking fix (FEL-55
+        -- DoD bullet 7 follow-up) exists to rule out elsewhere. A real C
+        -- preprocessor treats #error as fatal; this does too now.
+        throw <| IO.userError s!"#error: {stripWS (dropN directive 5)}"
       else
         pure st  -- #pragma, #line, etc. — ignore
     else
