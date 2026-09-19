@@ -11,6 +11,17 @@ structure ParseState where
   typedefNames : List String := []
   pendingGlobals : List GlobalDecl := []
   pendingExterns : List ExternDecl := []
+  -- FEL-68: every enum constant's resolved value, populated incrementally
+  -- as each `enum` is parsed (see `parseEnumDef`) — needed by
+  -- `parseArraySuffix` (`char buf[BUF_SIZE];`) and `parseSwitchCases`
+  -- (`case RED:`), both of which need a compile-time-constant integer
+  -- DURING parsing, before `CCC.Syntax.EnumResolve.resolveProgram`'s own
+  -- whole-program post-parse pass ever runs. A plain expression use of
+  -- an enum constant (`return RED;`) does NOT need this table at all —
+  -- that case is handled entirely by the post-parse pass instead, since
+  -- an ordinary `Expr.var` node has nowhere better to carry a resolved
+  -- value until then.
+  enumValues : List (String × Int) := []
   -- Struct field lists discovered while parsing `typedef struct NAME
   -- { ... } ALIAS;` — previously this shape's body was skipped entirely
   -- (no fields ever reached `prog.structs`), so `lookupFieldType`/
@@ -328,6 +339,12 @@ def intToNatChecked (value : Int) : Except String Nat :=
 partial def parseArraySuffix (ty : CType) : Parser CType := do
   let hasArray : Bool ← consumeIfKind .lbracket
   if hasArray then
+    let rec skipToRBracket : Parser Unit := do
+      let t ← currentToken
+      match t.kind with
+      | .rbracket => pure ()
+      | .eof => pure ()
+      | _ => let _ ← advance; skipToRBracket
     let sizeTok : Token ← currentToken
     match sizeTok.kind with
     | .intLit n =>
@@ -342,14 +359,28 @@ partial def parseArraySuffix (ty : CType) : Parser CType := do
         -- T[] → pointer (unsized array)
         let _ ← advance
         pure (.pointer ty)
+    | .ident enumName =>
+        -- FEL-68: `char buf[BUF_SIZE];` — an enum constant used as an
+        -- array size (a common pre-`static const`/`#define` idiom, and
+        -- still common in real code). Only handled when `enumName`
+        -- names an already-declared enum constant (real C requires the
+        -- enum to be declared before use here too); anything else falls
+        -- through to the generic complex-expression skip below.
+        let st ← get
+        match st.enumValues.find? (·.1 == enumName) with
+        | some (_, v) =>
+            match intToNatChecked v with
+            | .ok n =>
+                let _ ← advance
+                let _ ← expectKind .rbracket "']'"
+                pure (.array ty n)
+            | .error msg => throw s!"{msg} at {sizeTok.loc.line}:{sizeTok.loc.col}"
+        | none =>
+            skipToRBracket
+            let _ ← expectKind .rbracket "']'"
+            pure (.array ty 0)  -- size 0 as placeholder
     | _ =>
         -- Complex expression as array size — skip to ]
-        let rec skipToRBracket : Parser Unit := do
-          let t ← currentToken
-          match t.kind with
-          | .rbracket => pure ()
-          | .eof => pure ()
-          | _ => let _ ← advance; skipToRBracket
         skipToRBracket
         let _ ← expectKind .rbracket "']'"
         pure (.array ty 0)  -- size 0 as placeholder
@@ -1002,6 +1033,19 @@ partial def parseSwitchCases (acc : List (Option Int × List Stmt × Loc))
                 let _ ← advance
                 pure (-v)
             | _ => pure 0  -- approximate
+        | .ident enumName =>
+            -- FEL-68: `case RED:` — an enum constant used as a case
+            -- label. Only handled when `enumName` names an
+            -- already-declared enum constant; anything else falls
+            -- through to the generic complex-expression skip below.
+            let st ← get
+            match st.enumValues.find? (·.1 == enumName) with
+            | some (_, v) =>
+                let _ ← advance
+                pure v
+            | none =>
+                skipToColon
+                pure 0
         | _ =>
             -- Complex expression — skip to : at depth 0
             skipToColon
@@ -1300,6 +1344,13 @@ partial def parseEnumDef : Parser EnumDef := do
   let values ← parseEnumValues []
   let _ ← expectKind .rbrace "'}'"
   let _ ← expectKind .semi "';'"
+  -- FEL-68: register this enum's resolved values immediately (see
+  -- `ParseState.enumValues`'s docstring), using the SAME resolution
+  -- function `CCC.Syntax.EnumResolve.resolveProgram`'s whole-program
+  -- pass uses later, so a case label / array size seen here and a plain
+  -- expression use seen anywhere else can never disagree.
+  modify fun st => { st with
+    enumValues := st.enumValues ++ CCC.Syntax.EnumResolve.resolveEnumValues values }
   pure { name := name, values := values, loc := startTok.loc }
 
 partial def parseTypedefDecl : Parser TypedefDecl := do

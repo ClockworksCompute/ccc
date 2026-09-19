@@ -24,19 +24,19 @@
   `parseProgram` directly) sees an already-resolved program uniformly —
   no separate pass to remember to invoke.
 
-  Known limitations, both narrow and explicitly out of scope for this
-  slice (see FEL-68 in the project tracker for follow-ups):
+  `switch` case labels (`case RED:`) and array sizes (`char buf[BUF];`)
+  need a resolved value DURING PARSING, before this module's own
+  post-parse `resolveProgram` walk ever runs — so `Parse.parseEnumDef`
+  also calls `resolveEnumValues` directly as each `enum` is declared,
+  registering the results into `ParseState.enumValues`, which
+  `Parse.parseArraySuffix` and `Parse.parseSwitchCases` both consult.
+
+  Known limitation, narrow and explicitly out of scope for this slice
+  (see FEL-68 in the project tracker for follow-ups):
   - No lexical scope tracking: a local variable or parameter that happens
     to share a name with an enum constant is (incorrectly, but rarely in
     real code) ALSO replaced by the constant's value. The same "practical
     C subset" tradeoff the rest of this compiler already makes elsewhere.
-  - `switch` CASE LABELS (`case RED:`) are resolved to a literal integer
-    much earlier, directly during parsing (`parseSwitchCases`), before
-    this table exists — a named case label still silently becomes
-    `case 0:` today. Fixing that needs the enum table available AT PARSE
-    TIME (threaded incrementally through `ParseState` as each `enum` is
-    declared), a different and larger change than this post-parse
-    rewrite; not attempted here.
 -/
 
 import CCC.Syntax.AST
@@ -47,8 +47,18 @@ namespace CCC.Syntax.EnumResolve
     member defaults to 0, each subsequent member defaults to
     (previous resolved value + 1) unless it carries an explicit
     `= value`, in which case the running default resumes counting up
-    from THAT value — exactly C's rule. -/
-private def resolveEnumValues (values : List (String × Option Int)) : List (String × Int) :=
+    from THAT value — exactly C's rule. Exported: `Parse.parseEnumDef`
+    calls this directly too, to register each enum's resolved values
+    into `ParseState.enumValues` AS IT PARSES (rather than only after
+    the whole program is parsed, which is what this module's own
+    post-parse `resolveProgram` rewrite does) — needed for the places
+    the parser demands a compile-time-constant integer immediately,
+    before this module's own whole-program pass ever runs: array sizes
+    (`char buf[BUF_SIZE];`) and `switch` case labels (`case RED:`). Both
+    call sites must agree on the exact same resolved values, which is
+    exactly why this one function is shared rather than reimplemented
+    in the parser. -/
+def resolveEnumValues (values : List (String × Option Int)) : List (String × Int) :=
   let (resolved, _) := values.foldl
     (fun (acc, nextDefault) (name, explicit?) =>
       let v := explicit?.getD nextDefault
@@ -101,8 +111,8 @@ private partial def resolveStmt (table : List (String × Int)) (s : Stmt) : Stmt
   | .block ss loc => .block (ss.map (resolveStmt table)) loc
   | .switch_ scrut cases loc =>
       -- Note: only the scrutinee and case BODIES go through the table
-      -- here; the case LABELS themselves were already fixed at parse
-      -- time (see the module docstring's limitation on `case RED:`).
+      -- here; the case LABELS themselves are already resolved to plain
+      -- ints during parsing (see `Parse.parseSwitchCases`).
       .switch_ (resolveExpr table scrut)
         (cases.map (fun (v, body, l) => (v, body.map (resolveStmt table), l))) loc
   | .doWhile b c loc => .doWhile (b.map (resolveStmt table)) (resolveExpr table c) loc

@@ -145,6 +145,97 @@ def main : IO UInt32 := do
   if ← expectExit "no_enum_unaffected" "int main() { return 5; }\n" 5
   then pass := pass + 1
 
+  -- FEL-68 follow-up: an enum constant used as an ARRAY SIZE
+  -- (`char buf[BUF];`). This is resolved at PARSE TIME via
+  -- `ParseState.enumValues`, not by the post-parse `resolveProgram`
+  -- rewrite above (arrays sizes must be known during parsing), so it
+  -- exercises a different code path than every case above.
+  total := total + 1
+  if ← expectExit "enum_as_array_size"
+    ("enum Sizes { BUF = 8, SMALL = 4 };\n" ++
+     "int main() {\n  char buf[BUF];\n  buf[0] = 'a';\n  buf[BUF - 1] = 'z';\n  return sizeof(buf);\n}\n")
+    8
+  then pass := pass + 1
+
+  -- Cross-check the array-size case directly against `cc`.
+  total := total + 1
+  do
+    let src := "enum Sizes { BUF = 8, SMALL = 4 };\n" ++
+      "int main() {\n  char buf[BUF];\n  buf[0] = 'a';\n  buf[BUF - 1] = 'z';\n  return sizeof(buf);\n}\n"
+    match ← enumCompileToArm src with
+    | .error e => IO.eprintln s!"✗ enum_array_size_matches_cc: compile error: {e}"
+    | .ok asm =>
+        try
+          let cccExit ← enumAssembleAndRun asm "enum_array_size_matches_cc"
+          let srcPath := "/tmp/ccc_enum_arrsize_cc_ref.c"
+          let ccBin := "/tmp/ccc_enum_arrsize_cc_ref_bin"
+          IO.FS.writeFile srcPath src
+          let ccCompile ← IO.Process.output { cmd := "cc", args := #["-o", ccBin, srcPath] }
+          if ccCompile.exitCode != 0 then
+            IO.eprintln s!"✗ enum_array_size_matches_cc: cc failed to compile the reference:\n{ccCompile.stderr}"
+          else
+            let ccRun ← IO.Process.output { cmd := ccBin, args := #[] }
+            if cccExit == ccRun.exitCode then
+              IO.println s!"✓ enum_array_size_matches_cc: CCC={cccExit}, cc={ccRun.exitCode} (agree)"
+              pass := pass + 1
+            else
+              IO.eprintln s!"✗ enum_array_size_matches_cc: CCC={cccExit}, cc={ccRun.exitCode} (disagree!)"
+        catch e => IO.eprintln s!"✗ enum_array_size_matches_cc: {e}"
+
+  -- FEL-68 follow-up: an enum constant used as a SWITCH CASE LABEL
+  -- (`case RED:`). Also resolved at parse time, via `parseSwitchCases`
+  -- consulting `ParseState.enumValues` directly (this label is
+  -- resolved to a literal int BEFORE the post-parse `resolveProgram`
+  -- walk exists, so it is a separate code path from the scrutinee
+  -- expression, which the switch_ case above already covers).
+  total := total + 1
+  if ← expectExit "enum_as_switch_case_label"
+    ("enum Color { RED, GREEN, BLUE };\n" ++
+     "int classify(int c) {\n" ++
+     "  switch (c) {\n" ++
+     "    case RED: return 100;\n" ++
+     "    case GREEN: return 200;\n" ++
+     "    case BLUE: return 300;\n" ++
+     "    default: return -1;\n" ++
+     "  }\n" ++
+     "}\n" ++
+     "int main() { return classify(GREEN); }\n")
+    200
+  then pass := pass + 1
+
+  -- Cross-check the switch-case-label case directly against `cc`.
+  total := total + 1
+  do
+    let src := "enum Color { RED, GREEN, BLUE };\n" ++
+      "int classify(int c) {\n" ++
+      "  switch (c) {\n" ++
+      "    case RED: return 100;\n" ++
+      "    case GREEN: return 200;\n" ++
+      "    case BLUE: return 300;\n" ++
+      "    default: return -1;\n" ++
+      "  }\n" ++
+      "}\n" ++
+      "int main() { return classify(BLUE); }\n"
+    match ← enumCompileToArm src with
+    | .error e => IO.eprintln s!"✗ enum_switch_matches_cc: compile error: {e}"
+    | .ok asm =>
+        try
+          let cccExit ← enumAssembleAndRun asm "enum_switch_matches_cc"
+          let srcPath := "/tmp/ccc_enum_switch_cc_ref.c"
+          let ccBin := "/tmp/ccc_enum_switch_cc_ref_bin"
+          IO.FS.writeFile srcPath src
+          let ccCompile ← IO.Process.output { cmd := "cc", args := #["-o", ccBin, srcPath] }
+          if ccCompile.exitCode != 0 then
+            IO.eprintln s!"✗ enum_switch_matches_cc: cc failed to compile the reference:\n{ccCompile.stderr}"
+          else
+            let ccRun ← IO.Process.output { cmd := ccBin, args := #[] }
+            if cccExit == ccRun.exitCode then
+              IO.println s!"✓ enum_switch_matches_cc: CCC={cccExit}, cc={ccRun.exitCode} (agree)"
+              pass := pass + 1
+            else
+              IO.eprintln s!"✗ enum_switch_matches_cc: CCC={cccExit}, cc={ccRun.exitCode} (disagree!)"
+        catch e => IO.eprintln s!"✗ enum_switch_matches_cc: {e}"
+
   IO.println ""
   IO.println "═══════════════════════════════════════════"
   IO.println s!"  Enum resolution tests: {pass}/{total} passed"
