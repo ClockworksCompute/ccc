@@ -19,6 +19,25 @@ private def isPointerTy (ty : Syntax.CType) : Bool :=
   | .pointer _ => true
   | _ => false
 
+/-- Strip `typedef`/`const`/`volatile`/`restrict` wrappers down to the
+    underlying type. FEL-68 follow-up: `state.getType` stores a
+    variable's declared type EXACTLY as written (`p.ty` / the `varDecl`
+    type), never resolved through typedefs — so `typedef int (*op_t)
+    (int,int); op_t p; *p;` reported `p` as type `op_t` and rejected the
+    dereference as "non-pointer variable", even though `op_t` resolves
+    to a function-pointer type. Local to this file rather than shared
+    with the emitter's own `resolveType` (`CCC.Emit.EmitX86`) to avoid
+    Verify depending on Emit; only the one check below needs it today. -/
+private partial def resolveTypedefTy (typedefs : List Syntax.TypedefDecl) (ty : Syntax.CType)
+    : Syntax.CType :=
+  match ty with
+  | .typedef_ name =>
+      match typedefs.find? (·.name == name) with
+      | some td => resolveTypedefTy typedefs td.target
+      | none => ty
+  | .const_ inner | .volatile_ inner | .restrict_ inner => resolveTypedefTy typedefs inner
+  | _ => ty
+
 /-- Is this expression a spelling of the null pointer constant? Mirrors
     `BranchAnalysis`'s recognizer so `p = NULL;` (which preprocesses to a
     cast of an int literal) is treated the same as `p = 0;` (FEL-49 #2). -/
@@ -163,9 +182,22 @@ private def checkDereferenceable (ctx : VerifyCtx) (state : FlowState)
           -- is a name we simply never modelled (e.g. a global) — leave it
           -- to whatever narrower check applies rather than over-claiming.
           match state.getType name with
-          | some ty =>
-              if isPointerTy ty then state
-              else state.addViolation (mkDerefNonPointerViolation ctx loc fullExpr name ty)
+          | some rawTy =>
+              let ty := resolveTypedefTy ctx.program.typedefs rawTy
+              match ty with
+              | .funcPtr _ _ =>
+                  -- FEL-68 follow-up: a function pointer is always
+                  -- dereferenceable in C (`(*fp)(...)` and `fp(...)` mean
+                  -- the same thing) -- not flagged as a violation here.
+                  -- Known limitation: unlike object pointers, function
+                  -- pointers aren't tracked in `PtrState` at all (see
+                  -- `handleVarDecl`), so an uninitialized/null function
+                  -- pointer dereference isn't caught -- a separate,
+                  -- smaller gap from the false positive fixed here.
+                  state
+              | _ =>
+                  if isPointerTy ty then state
+                  else state.addViolation (mkDerefNonPointerViolation ctx loc fullExpr name ty)
           | none => state
   | none =>
       state.addViolation (mkUnresolvedDerefViolation ctx loc fullExpr)

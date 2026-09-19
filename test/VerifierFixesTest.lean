@@ -398,6 +398,20 @@ def main : IO UInt32 := do
      "}\n")
   then pass := pass + 1
 
+  -- FEL-68 follow-up: `state.getType` stores a variable's declared type
+  -- EXACTLY as written, never resolved through typedefs, so a TYPEDEF'D
+  -- function-pointer type (`typedef int (*op_t)(int,int); op_t p;`)
+  -- made `(*p)(...)` look like a dereference of a non-pointer, plain
+  -- `op_t` value -- rejected outright as a memory-safety violation, for
+  -- perfectly ordinary, valid code (the callback-parameter/dispatch
+  -- pattern real C libraries use constantly).
+  total := total + 1
+  if ← expectClean "FEL68_funcptr_deref_of_typedef_not_flagged"
+    ("int add(int a, int b) { return a + b; }\n" ++
+     "typedef int (*op_t)(int, int);\n" ++
+     "int main() {\n  op_t p = add;\n  return (*p)(3, 4);\n}\n")
+  then pass := pass + 1
+
   IO.println s!"\n═══ Results: {pass}/{total} passed ═══"
   if pass == total then
     IO.println "All verifier-fixes regression tests passed!"

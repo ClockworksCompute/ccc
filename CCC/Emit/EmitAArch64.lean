@@ -534,10 +534,24 @@ partial def emitArmExpr (env : TypeEnv) (expr : Expr) : ArmCodegenM Unit := do
           emitArmExpr env operand
           let st ← get
           let ptrTy := resolveType st.typedefs (inferExprType env st.structDefs operand)
-          let valTy := match ptrTy with
-            | .pointer elem => elem
-            | _ => .long
-          emitArmLoadFromAddr valTy
+          match ptrTy with
+          | .funcPtr _ _ =>
+              -- FEL-68 follow-up: dereferencing a function pointer is a
+              -- no-op in C -- `*fp` and `fp` denote the same function
+              -- (`(*fp)(...)` and `fp(...)` are equivalent call syntax).
+              -- Falling through to the generic "load memory at this
+              -- address" path below would instead read the target
+              -- FUNCTION'S CODE BYTES as if they were data and branch to
+              -- that garbage on the subsequent `.callFnPtr` -- reliably
+              -- a crash (confirmed: SIGBUS) rather than a silently wrong
+              -- value, but a crash all the same for an extremely common,
+              -- valid call syntax.
+              pure ()
+          | _ =>
+              let valTy := match ptrTy with
+                | .pointer elem => elem
+                | _ => .long
+              emitArmLoadFromAddr valTy
       | .addrOf =>
           let _ ← emitArmLValueAddr env operand
           pure ()
@@ -755,8 +769,17 @@ partial def emitArmCall (env : TypeEnv) (fn : String) (args : List Expr) : ArmCo
   -- C's ordinary scoping — a parameter shadows a same-named global
   -- function), so it is resolved here as an indirect call: load the
   -- pointer value, then `blr`, exactly like an explicit `(*fp)(...)`
-  -- call already does.
-  if (lookupOffset st0.localOffsets fn).isSome then
+  -- call already does. A GLOBAL variable named `fn` is checked too —
+  -- unlike shadowing, a global variable and a function can never share
+  -- a name in valid C, so there is no ambiguity to resolve. This case
+  -- is worse than a mere link failure if left unhandled: `bl _fn`
+  -- against a global variable's `_fn` DATA symbol still links fine
+  -- (Mach-O doesn't distinguish symbol kinds for a plain branch), so it
+  -- silently produces a binary that branches into the stored pointer
+  -- VALUE's bytes as if they were code — confirmed to crash (SIGBUS),
+  -- but only at runtime, after compiling and linking with no warning.
+  if (lookupOffset st0.localOffsets fn).isSome ||
+      (st0.globalNames.find? (fun (n, _) => n == fn)).isSome then
     -- Same push-fn-ptr-first, pop-into-scratch-last ordering as
     -- `.callFnPtr` above, and for the same reason: loading the
     -- function-pointer value into `x0` right before `blr` would clobber
@@ -1144,17 +1167,40 @@ def emitProgramAArch64 (prog : CCC.Syntax.Program) (harden : Bool := false)
           globalDataLines := globalDataLines ++ [directiveFor v]
     | some initExpr =>
         -- Initialized → DATA
-        let val := match initExpr with
-          | .intLit n _ => n
-          | .charLit c _ => Int.ofNat c.toNat
-          | _ => 0
         globalDataLines := globalDataLines ++ [s!".globl _{g.name}", s!".p2align {alignPow}", s!"_{g.name}:"]
-        if sz ≤ 1 then
-          globalDataLines := globalDataLines ++ [s!"    .byte {val}"]
-        else if sz ≤ 4 then
-          globalDataLines := globalDataLines ++ [s!"    .long {val}"]
-        else
-          globalDataLines := globalDataLines ++ [s!"    .quad {val}"]
+        let isKnownFunc (name : String) : Bool :=
+          prog.functions.any (·.name == name) || prog.externs.any (·.name == name)
+        match initExpr with
+        | .var name _ =>
+            if isKnownFunc name then
+              -- FEL-68 follow-up: `op_t global_op = add3;` -- a function
+              -- NAME as a global's initializer (function-pointer-typed
+              -- vtable/dispatch-table globals are a common real-C
+              -- pattern). Previously this silently fell to the `_ => 0`
+              -- catch-all below, storing a null pointer -- a function
+              -- pointer global initialized this way looked "verified"
+              -- and compiled clean, but crashed (SIGSEGV, confirmed) the
+              -- instant it was called. `.quad _name` is a real,
+              -- relocatable reference to the function's own address,
+              -- exactly like taking `&add3` anywhere else.
+              globalDataLines := globalDataLines ++ [s!"    .quad _{name}"]
+            else
+              -- A global initialized from another (non-function)
+              -- variable's value isn't a compile-time constant this
+              -- emitter can fold — still out of scope, same as any
+              -- other non-literal expression below.
+              globalDataLines := globalDataLines ++ [s!"    .quad 0"]
+        | _ =>
+            let val := match initExpr with
+              | .intLit n _ => n
+              | .charLit c _ => Int.ofNat c.toNat
+              | _ => 0
+            if sz ≤ 1 then
+              globalDataLines := globalDataLines ++ [s!"    .byte {val}"]
+            else if sz ≤ 4 then
+              globalDataLines := globalDataLines ++ [s!"    .long {val}"]
+            else
+              globalDataLines := globalDataLines ++ [s!"    .quad {val}"]
   let textSection := [".section __TEXT,__text"] ++ allInstrs
   let cstringSection :=
     if allData.isEmpty then []

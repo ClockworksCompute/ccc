@@ -153,15 +153,12 @@ suites:
 `float`/`double` arithmetic parses and emits, but every float literal and
 operation currently computes as `0` — this does not panic, it silently
 produces the wrong answer, so don't rely on floating point yet.
-Function pointers work for the common patterns (a callback parameter
-called by name, an array-of-function-pointers dispatch table — see
-`test/FuncPtrTest.lean`) but a global variable holding a function
-pointer isn't resolved as a call target, and the verifier doesn't yet
-resolve typedef'd function-pointer types before its dereference check,
-so `(*fp)(...)` on a `typedef`'d function-pointer type is rejected as a
-false-positive "non-pointer variable" violation. `--target x86_64` is
-parsed but not wired up; the x86-64 emitter (`EmitX86`) exists in tree
-but is unverified and has its own, separate 8-argument call limit. This
+Function pointers work for the common patterns — a callback parameter
+called by name, an explicit `(*fp)(...)` call, a global holding a
+function pointer, an array-of-function-pointers dispatch table — see
+`test/FuncPtrTest.lean`. `--target x86_64` is parsed but not wired up;
+the x86-64 emitter (`EmitX86`) exists in tree but is unverified and has
+its own, separate 8-argument call limit. This
 is a proof-of-concept — the test suites define the validated surface,
 and the gaps above are tracked as the "emitter completeness" work in
 the project's Linear tracker.
@@ -185,13 +182,13 @@ lake env lean --run test/Phase2Features.lean       # 37/37 — language features
 lake env lean --run test/PreprocessTest.lean       # 14/14 — preprocessor
 lake env lean --run test/TypedefTest.lean          # 10/10 — typedef resolution
 lake env lean --run test/VerifierAccuracyTest.lean # 10/10 — false-positive guard
-lake env lean --run test/VerifierFixesTest.lean    # 27/27 — verifier soundness/precision regressions
+lake env lean --run test/VerifierFixesTest.lean    # 28/28 — verifier soundness/precision regressions
 lake env lean --run test/HardenTest.lean           #  5/5  — --harden runtime bounds checks
 lake env lean --run test/StructLayoutTest.lean     # 10/10 — struct alignment, sizeof(expr)
 lake env lean --run test/StackArgsTest.lean        #  6/6  — AAPCS64 stack args (>8 params)
 lake env lean --run test/GlobalArrayTest.lean      # 10/10 — global array declarations/initializers
 lake env lean --run test/EnumResolveTest.lean      # 11/11 — enum constant resolution
-lake env lean --run test/FuncPtrTest.lean          #  6/6  — function pointers / indirect calls
+lake env lean --run test/FuncPtrTest.lean          # 10/10 — function pointers / indirect calls
 lake env lean --run test/E2EAllDemos.lean          # demo programs
 
 bash test/regression/run_regressions.sh             # numbered CCC-BUG-NNN repros
