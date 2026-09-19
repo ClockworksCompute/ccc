@@ -12,10 +12,16 @@ def usage : String :=
   "Usage: ccc <input.c> [-o <output>]\n" ++
   "       ccc -c <input.c> -o <output.s>\n" ++
   "       ccc --verify-report <input.c>\n" ++
+  "       ccc --report=json <input.c>\n" ++
   "       ccc [--harden] [--allow-degraded] <input.c> -o <output>\n" ++
   "  Compile a C source file with memory safety verification.\n" ++
   "  -c: compile to assembly only (no assembling/linking).\n" ++
   "  --verify-report: print per-function verification status.\n" ++
+  "  --report=json: print the same verification result as one line of\n" ++
+  "    JSON ({file, functions: [{name, status, violations, degradedReasons}],\n" ++
+  "    summary: {totalFunctions, verified, degraded, exempt, totalViolations,\n" ++
+  "    safe}}) for programmatic consumers instead of the prose report.\n" ++
+  "    Exits 0 iff `summary.safe` is true.\n" ++
   "  --allow-degraded: by default, ccc refuses to emit (exits 1) when any\n" ++
   "    function was analysed with reduced precision (`degraded`: it uses\n" ++
   "    goto/labels, or has a switch case that can fall through) even if\n" ++
@@ -132,6 +138,25 @@ def main (args : List String) : IO UInt32 := do
             if r.funName != "program" then
               IO.println (formatFunReport r)
           return 0
+  | ["--report=json", inputFile] => do
+      -- FEL-70: structured output for programmatic consumers (corpus.sh,
+      -- the mutation fuzzer, an eventual patch-synthesis loop) instead of
+      -- scraping the prose report meant for a terminal.
+      let filename := (inputFile.splitOn "/").getLast!
+      let source ← readAndPreprocess inputFile
+      match CCC.parseSource source with
+      | .error e =>
+          let errJson := Lean.Json.mkObj [
+            ("file", Lean.Json.str filename),
+            ("parseError", Lean.Json.str e)
+          ]
+          IO.println errJson.compress
+          return 1
+      | .ok prog =>
+          let report := CCC.Verify.verifyProgramReport prog
+          let reportJson := CCC.Error.programReportToJson filename report
+          IO.println reportJson.compress
+          return (if report.isSafe then 0 else 1)
   | _ => pure ()
 
   -- Strip any leading `--harden` / `--allow-degraded` flags, in either

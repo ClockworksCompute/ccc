@@ -5,6 +5,7 @@ import CCC.Syntax.Build
 import CCC.Syntax.Layout
 import CCC.Syntax.EnumResolve
 import CCC.Error.Report
+import CCC.Error.JsonReport
 import CCC.Parse.Token
 import CCC.Parse.Lex
 import CCC.Parse.Parse

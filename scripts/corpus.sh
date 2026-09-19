@@ -19,8 +19,15 @@
 #
 # NOTE ON EXIT CODES: `ccc` in verify-only mode currently exits 0 even when
 # it reports memory-safety violations, because "force-emit" still produces
-# assembly for unsafe programs (see FEL-40). This script therefore reads the
-# printed report text, not the process exit code, to determine the verdict.
+# assembly for unsafe programs (see FEL-40). This script therefore reads a
+# structured `ccc --report=json` result (FEL-70), not the process exit
+# code, to determine the accepted/rejected verdict -- previously this grepped
+# the prose report for "memory safety violation(s) found" text, which is
+# exactly how FEL-40's exit-code bug went unnoticed for a while. Parse and
+# emission failures are still detected via the plain (non-JSON) invocation,
+# since `--report=json` only runs the verifier -- it never attempts to emit
+# assembly at all, so it cannot see an emission-stage failure (e.g. "too many
+# arguments", "unknown variable") the way the old prose path could.
 #
 # This is a measurement script, not a CI gate: it always exits 0. The
 # checked-in baseline snapshot lives at docs/corpus-results.md.
@@ -36,6 +43,11 @@ TIMEOUT_SECS=20
 if [ ! -x "$CCC_BIN" ]; then
     echo "error: $CCC_BIN not found or not executable." >&2
     echo "       Build it first: (cd '$REPO_ROOT' && lake build ccc)" >&2
+    exit 0
+fi
+
+if ! command -v jq >/dev/null 2>&1; then
+    echo "error: jq not found on PATH (needed to parse 'ccc --report=json' output)." >&2
     exit 0
 fi
 
@@ -79,6 +91,9 @@ run_ccc() {
     local file="$1"
     local out status outfile
 
+    # Pass 1: the plain (prose) invocation, solely to catch parse and
+    # emission failures -- `--report=json` never attempts emission, so it
+    # cannot see this class of failure (see the NOTE ON EXIT CODES above).
     outfile="$(mktemp)"
     run_with_timeout "$TIMEOUT_SECS" "$outfile" "$CCC_BIN" "$file"
     status=$?
@@ -97,15 +112,40 @@ run_ccc() {
         return
     fi
 
-    if printf '%s\n' "$out" | grep -q "memory safety violation(s) found"; then
-        RC_VERDICT="rejected"
-        RC_LINE=$(printf '%s\n' "$out" | grep -o "violation at line [0-9]*" | head -1 | grep -o "[0-9]*$")
-        [ -z "$RC_LINE" ] && RC_LINE="?"
+    # Pass 2: the structured verdict itself, via --report=json (FEL-70).
+    outfile="$(mktemp)"
+    run_with_timeout "$TIMEOUT_SECS" "$outfile" "$CCC_BIN" "--report=json" "$file"
+    status=$?
+    out="$(cat "$outfile")"
+    rm -f "$outfile"
+
+    if [ "$status" -eq 124 ] || [ "$status" -eq 137 ]; then
+        RC_VERDICT="timeout"
+        RC_LINE="-"
         return
     fi
 
-    RC_VERDICT="accepted"
-    RC_LINE="-"
+    if ! printf '%s' "$out" | jq -e . >/dev/null 2>&1; then
+        RC_VERDICT="parse-failed"
+        RC_LINE="-"
+        return
+    fi
+
+    if printf '%s' "$out" | jq -e '.parseError' >/dev/null 2>&1; then
+        RC_VERDICT="parse-failed"
+        RC_LINE="-"
+        return
+    fi
+
+    if printf '%s' "$out" | jq -e '.summary.safe == true' >/dev/null 2>&1; then
+        RC_VERDICT="accepted"
+        RC_LINE="-"
+        return
+    fi
+
+    RC_VERDICT="rejected"
+    RC_LINE=$(printf '%s' "$out" | jq -r '.functions[].violations[0].loc.line // empty' | head -1)
+    [ -z "$RC_LINE" ] && RC_LINE="?"
 }
 
 n_total=0
