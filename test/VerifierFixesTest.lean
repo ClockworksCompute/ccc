@@ -50,6 +50,44 @@ def expectClean (name : String) (src : String) : IO Bool := do
     IO.eprintln s!"✗ {name}: {n} violation(s) found, expected 0 — false positive regression!"
     pure false
 
+/-- FEL-67: every non-synthetic function must be reported `.degraded`
+    (goto/labels, or a fall-through switch case) — status, independent of
+    violation count. -/
+def expectDegraded (name : String) (src : String) : IO Bool := do
+  let pp ← preprocess src "."
+  match parseProgram pp with
+  | .error e =>
+      IO.eprintln s!"✗ {name}: parse error: {e.take 200}"
+      pure false
+  | .ok prog =>
+      let report := Verify.verifyProgramReport prog
+      let fns := report.results.filter (·.funName != "program")
+      if fns.any (·.status == .degraded) then
+        IO.println s!"✓ {name}: degraded, as expected"
+        pure true
+      else
+        IO.eprintln s!"✗ {name}: no function reported degraded — regression!"
+        pure false
+
+/-- The mirror check: every non-synthetic function must be `.verified`,
+    NOT `.degraded` — guards against over-eagerly flagging ordinary,
+    fully-analysable control flow (e.g. a break-terminated switch). -/
+def expectNotDegraded (name : String) (src : String) : IO Bool := do
+  let pp ← preprocess src "."
+  match parseProgram pp with
+  | .error e =>
+      IO.eprintln s!"✗ {name}: parse error: {e.take 200}"
+      pure false
+  | .ok prog =>
+      let report := Verify.verifyProgramReport prog
+      let fns := report.results.filter (·.funName != "program")
+      if fns.any (·.status == .degraded) then
+        IO.eprintln s!"✗ {name}: a function was (wrongly) reported degraded — false-positive regression!"
+        pure false
+      else
+        IO.println s!"✓ {name}: not degraded, as expected"
+        pure true
+
 def main : IO UInt32 := do
   IO.println "═══ Verifier fixes regression suite (FEL-40..49) ═══"
   let mut pass : Nat := 0
@@ -295,6 +333,62 @@ def main : IO UInt32 := do
               pass := pass + 1
             else
               IO.eprintln s!"✗ FEL55_typedef_struct_own_name_fields: exit {runOut.exitCode}, expected 42"
+
+  -- FEL-67: degraded status (goto, or a fall-through switch case) must be
+  -- computed AND reported — a function analysed with reduced precision is
+  -- not "verified" just because zero violations were found in the parts
+  -- CCC could analyse.
+  total := total + 1
+  if ← expectDegraded "FEL67_goto_marks_function_degraded"
+    ("int *p;\n" ++
+     "int main() {\n" ++
+     "  p = malloc(8);\n" ++
+     "  if (p == 0) return 1;\n" ++
+     "  int n = 0;\n" ++
+     "again:\n" ++
+     "  *p = n;\n" ++
+     "  free(p);\n" ++
+     "  n = n + 1;\n" ++
+     "  if (n < 2) { goto again; }\n" ++
+     "  return 0;\n" ++
+     "}\n")
+  then pass := pass + 1
+
+  total := total + 1
+  if ← expectDegraded "FEL67_switch_fallthrough_marks_function_degraded"
+    ("int main(int argc) {\n" ++
+     "  int r = 0;\n" ++
+     "  switch (argc) {\n" ++
+     "    case 1: r = 1;\n" ++       -- no break: falls through to case 2
+     "    case 2: r = 2; break;\n" ++
+     "    default: r = 3; break;\n" ++
+     "  }\n" ++
+     "  return r;\n" ++
+     "}\n")
+  then pass := pass + 1
+
+  total := total + 1
+  if ← expectNotDegraded "FEL67_break_terminated_switch_not_degraded"
+    ("int main(int argc) {\n" ++
+     "  int r = 0;\n" ++
+     "  switch (argc) {\n" ++
+     "    case 1: r = 1; break;\n" ++
+     "    case 2: r = 2; break;\n" ++
+     "    default: r = 3; break;\n" ++
+     "  }\n" ++
+     "  return r;\n" ++
+     "}\n")
+  then pass := pass + 1
+
+  total := total + 1
+  if ← expectNotDegraded "FEL67_ordinary_loop_not_degraded"
+    ("int main() {\n" ++
+     "  int i = 0;\n" ++
+     "  int sum = 0;\n" ++
+     "  while (i < 10) { sum = sum + i; i = i + 1; }\n" ++
+     "  return sum;\n" ++
+     "}\n")
+  then pass := pass + 1
 
   IO.println s!"\n═══ Results: {pass}/{total} passed ═══"
   if pass == total then

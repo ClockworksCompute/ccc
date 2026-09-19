@@ -12,10 +12,17 @@ def usage : String :=
   "Usage: ccc <input.c> [-o <output>]\n" ++
   "       ccc -c <input.c> -o <output.s>\n" ++
   "       ccc --verify-report <input.c>\n" ++
-  "       ccc --harden <input.c> -o <output>\n" ++
+  "       ccc [--harden] [--allow-degraded] <input.c> -o <output>\n" ++
   "  Compile a C source file with memory safety verification.\n" ++
   "  -c: compile to assembly only (no assembling/linking).\n" ++
   "  --verify-report: print per-function verification status.\n" ++
+  "  --allow-degraded: by default, ccc refuses to emit (exits 1) when any\n" ++
+  "    function was analysed with reduced precision (`degraded`: it uses\n" ++
+  "    goto/labels, or has a switch case that can fall through) even if\n" ++
+  "    zero violations were found in what could be analysed — a degraded\n" ++
+  "    function was NOT proven memory-safe, and treating it the same as a\n" ++
+  "    fully verified one would be dishonest. Pass this flag to emit\n" ++
+  "    anyway; the degraded function(s) and why are still printed.\n" ++
   "  --harden: EXPERIMENTAL (FEL-59, in progress). Emit a binary even when\n" ++
   "    the verifier finds violations it cannot clear, with a loud warning\n" ++
   "    naming exactly what was not proven. Exit code stays 0. As of this\n" ++
@@ -64,18 +71,40 @@ def violationTag : SafetyProperty → String
   | .noDivByZero     => "div-by-zero"
 
 open CCC.Syntax in
-/-- Format a single FunVerifyResult as one line of verify-report output. -/
+/-- The reason(s) a function is `degraded`, from its `degradedBy`
+    evidence (see `Verify.verifyFunction`). -/
+def degradeReasons (r : FunVerifyResult) : List String :=
+  r.evidence.filterMap fun e =>
+    match e with
+    | .degradedBy _feature reason loc => some s!"{reason} (line {loc.line})"
+    | _ => none
+
+open CCC.Syntax in
+/-- Format a single FunVerifyResult as one line of verify-report output.
+    FEL-67: status (verified/degraded/exempt) and violation count are two
+    separate axes — a function can be `degraded` (goto, or a
+    fall-through switch case) with zero violations, and that must not be
+    reported as plain "verified (0 violations)", which is what this used
+    to do (it only ever checked `.exempt`, and otherwise treated "zero
+    violations" as synonymous with "fully verified"). -/
 def formatFunReport (r : FunVerifyResult) : String :=
   let nv := r.violations.length
+  let violationStr :=
+    if nv == 0 then "0 violations"
+    else
+      let tags := r.violations.map fun v => s!"{violationTag v.property} at line {v.loc.line}"
+      s!"{nv} violations: {String.intercalate ", " tags}"
   if r.status == .exempt then
-    s!"{r.funName}: exempt (uses setjmp)"
+    s!"{r.funName}: exempt (uses setjmp) [{violationStr}]"
+  else if r.status == .degraded then
+    let reasons := degradeReasons r
+    let reasonStr := if reasons.isEmpty then "reduced analysis precision"
+      else String.intercalate "; " reasons
+    s!"{r.funName}: degraded ({reasonStr}) — not fully proven memory-safe [{violationStr}]"
   else if nv == 0 then
     s!"{r.funName}: verified (0 violations)"
   else
-    let tags := r.violations.map fun v =>
-      s!"{violationTag v.property} at line {v.loc.line}"
-    let tagStr := String.intercalate ", " tags
-    s!"{r.funName}: degraded ({nv} violations: {tagStr})"
+    s!"{r.funName}: unsafe ({violationStr})"
 
 /-- Read and preprocess a source file. -/
 def readAndPreprocess (inputFile : String) : IO String := do
@@ -105,12 +134,16 @@ def main (args : List String) : IO UInt32 := do
           return 0
   | _ => pure ()
 
-  -- Strip an optional leading `--harden` flag before the usual argument
-  -- shapes (FEL-59, experimental — see the `usage` docstring above for
-  -- exactly what this does and does not do today).
-  let (harden, args) := match args with
-    | "--harden" :: rest => (true, rest)
-    | _ => (false, args)
+  -- Strip any leading `--harden` / `--allow-degraded` flags, in either
+  -- order, before the usual positional argument shapes are parsed. See
+  -- the `usage` docstring above for exactly what each one does.
+  let rec stripFlags (harden allowDegraded : Bool) (a : List String)
+      : Bool × Bool × List String :=
+    match a with
+    | "--harden" :: rest => stripFlags true allowDegraded rest
+    | "--allow-degraded" :: rest => stripFlags harden true rest
+    | _ => (harden, allowDegraded, a)
+  let (harden, allowDegraded, args) := stripFlags false false args
 
   -- Parse arguments
   let (inputFile, outputFile, compileOnly) ← do
@@ -147,6 +180,26 @@ def main (args : List String) : IO UInt32 := do
     IO.println "⚠️  registry never saw — is NOT checked (FEL-59 is not"
     IO.println "⚠️  finished) and can still misbehave exactly like an"
     IO.println "⚠️  unverified C program. Do not treat this as a safe binary."
+
+  -- FEL-67: a `degraded` function (goto/labels, or a switch case that can
+  -- fall through) was analysed with reduced precision and was NOT proven
+  -- memory-safe, even when zero violations were found in what CCC could
+  -- analyse. Previously this status was computed (`Verify.verifyFunction`)
+  -- but never surfaced anywhere the CLI actually looked: `--verify-report`
+  -- printed "verified (0 violations)" for such a function, and this gate
+  -- didn't exist at all, so `ccc` exited 0. Block by default, the same
+  -- way an actual violation blocks; `--allow-degraded` opts in explicitly.
+  let degradedFns : List CCC.Syntax.FunVerifyResult :=
+    match result.verifyResult with
+    | some vr => vr.results.filter (fun r => r.funName != "program" && r.status == .degraded)
+    | none => []
+  if !degradedFns.isEmpty && !allowDegraded then
+    IO.eprintln ""
+    IO.eprintln s!"ERROR: {degradedFns.length} function(s) were analysed with reduced precision (degraded) and were NOT proven memory-safe:"
+    for r in degradedFns do
+      IO.eprintln s!"  {formatFunReport r}"
+    IO.eprintln "Pass --allow-degraded to compile anyway (these functions were not fully checked)."
+    return 1
 
   -- FEL-40: `CCC.compile` never produces assembly for a program with
   -- violations (parse error, verification failure, or emission error all

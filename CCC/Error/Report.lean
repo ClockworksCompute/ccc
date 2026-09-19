@@ -85,6 +85,33 @@ inductive CompileStage where
   | linked (size : Nat) -- assembled and linked to binary with measured size
   deriving Repr, Inhabited
 
+/-- FEL-67: the reason(s) a single function was marked `degraded`, pulled
+    from its own `degradedBy` evidence entries (recorded by
+    `Verify.verifyFunction`). Falls back to a generic label if a function
+    is somehow `degraded` with no recorded reason (should not happen, but
+    stays honest rather than silently omitting the function). -/
+private def degradeReasonsFor (r : FunVerifyResult) : List String :=
+  r.evidence.filterMap (fun e =>
+    match e with
+    | .degradedBy _feature reason loc => some s!"{reason} (line {loc.line})"
+    | _ => none)
+
+/-- FEL-67: list every `degraded` function with why, so a success report
+    never reads as an unqualified "0 memory safety violations" when some
+    function's control flow (goto, or a fall-through switch case) was not
+    actually analysed with full precision. Empty string when nothing to
+    report, so callers can append it unconditionally. -/
+def formatDegradedFunctions (result : ProgramVerifyResult) : String :=
+  let degraded := result.degradedFunctions
+  if degraded.isEmpty then ""
+  else
+    let lines := result.results.filter (·.isDegraded) |>.map (fun r =>
+      let reasons := degradeReasonsFor r
+      let reasonStr := if reasons.isEmpty then "reduced analysis precision"
+        else String.intercalate "; " reasons
+      s!"  ⚠ {r.funName}: DEGRADED ({reasonStr}) — not fully proven memory-safe")
+    "\n" ++ String.intercalate "\n" lines
+
 /-- Format the success report for a safe program. Stage-truthful: only claims
     what was actually achieved. -/
 def formatSuccess (result : ProgramVerifyResult) (filename : String)
@@ -106,6 +133,7 @@ def formatSuccess (result : ProgramVerifyResult) (filename : String)
   s!"  ✓ {ptrOps} pointer operations verified\n" ++
   s!"  ✓ {arrChecks} array accesses verified ({staticB} static, {dynamicB} runtime-bounded)\n" ++
   s!"  ✓ 0 memory safety violations\n" ++
-  stageMsg
+  stageMsg ++
+  formatDegradedFunctions result
 
 end CCC.Error

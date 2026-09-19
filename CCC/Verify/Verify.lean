@@ -567,36 +567,110 @@ partial def analyzeStmt (ctx : VerifyCtx) (stmt : Syntax.Stmt) (state : FlowStat
 
 end
 
-/-- Does a function's body contain any `goto`/label control flow? Loop
-    fixpointing (above) covers `while`/`for`/`do-while`; a hand-rolled loop
-    built from `goto` is not modelled by the structural analysis at all
-    (there is no general CFG here — see FEL-43's follow-up), so such
+/-- FEL-67: find the LOCATION of the first `goto`/label in a function body,
+    not just a bare `Bool` — so the report (and the `degradedBy` evidence
+    entry below) can point at the exact line, not just say "somewhere".
+    Loop fixpointing (above) covers `while`/`for`/`do-while`; a hand-rolled
+    loop built from `goto` is not modelled by the structural analysis at
+    all (there is no general CFG here — see FEL-43's follow-up), so such
     functions are marked `degraded` rather than silently claiming full
     precision. -/
-private partial def stmtHasGoto (s : Syntax.Stmt) : Bool :=
+private partial def firstGotoLoc (s : Syntax.Stmt) : Option Syntax.Loc :=
   match s with
-  | .goto_ _ _ | .label_ _ _ _ => true
-  | .ifElse _ t e _ => t.any stmtHasGoto || e.any stmtHasGoto
-  | .while_ _ b _ => b.any stmtHasGoto
+  | .goto_ _ loc | .label_ _ _ loc => some loc
+  | .ifElse _ t e _ =>
+      match firstSome t firstGotoLoc with
+      | some l => some l
+      | none => firstSome e firstGotoLoc
+  | .while_ _ b _ => firstSome b firstGotoLoc
   | .for_ i _ _ b _ =>
-      (match i with | some s2 => stmtHasGoto s2 | none => false) || b.any stmtHasGoto
-  | .block ss _ => ss.any stmtHasGoto
-  | .switch_ _ cases _ => cases.any (fun (_, body, _) => body.any stmtHasGoto)
-  | .doWhile b _ _ => b.any stmtHasGoto
-  | _ => false
+      match i with
+      | some s2 => (match firstGotoLoc s2 with | some l => some l | none => firstSome b firstGotoLoc)
+      | none => firstSome b firstGotoLoc
+  | .block ss _ => firstSome ss firstGotoLoc
+  | .switch_ _ cases _ => firstSome cases (fun (_, body, _) => firstSome body firstGotoLoc)
+  | .doWhile b _ _ => firstSome b firstGotoLoc
+  | _ => none
 
-/-- Verify one function body. -/
+/-- Does a case body end with a statement that transfers control OUT of the
+    case (so it cannot fall through into the next one)? `.block` unwraps
+    to its last statement, matching `branchEndsWithReturn`'s convention. -/
+private partial def stmtEndsTerminal (stmts : List Syntax.Stmt) : Bool :=
+  match stmts.reverse with
+  | [] => false
+  | last :: _ =>
+      match last with
+      | .ret _ _ | .break_ _ | .continue_ _ | .goto_ _ _ => true
+      | .block inner _ => stmtEndsTerminal inner
+      | _ => false
+
+/-- FEL-49 #3 traded soundness on genuine (break-less) fall-through in a
+    `switch` for eliminating a false use-after-free/double-free on the far
+    more common break-terminated shape — see the `.switch_` case in
+    `analyzeStmt` above. That trade is only honest if a case that DOES
+    fall through is flagged as reduced-precision rather than silently
+    treated as `verified`. The syntactically last case needs no
+    terminator (nothing to fall through TO), so it's excluded. -/
+private def firstFallthroughCaseLoc
+    (cases : List (Option Int × List Syntax.Stmt × Syntax.Loc)) : Option Syntax.Loc :=
+  firstSome cases.dropLast (fun (_, body, loc) =>
+    if stmtEndsTerminal body then none else some loc)
+
+/-- Find the location of the first `switch` anywhere in a function body
+    (including nested inside other statements) that has a fall-through
+    case, per `firstFallthroughCaseLoc` above. -/
+private partial def firstSwitchFallthroughLoc (s : Syntax.Stmt) : Option Syntax.Loc :=
+  match s with
+  | .switch_ _ cases _ =>
+      match firstFallthroughCaseLoc cases with
+      | some l => some l
+      | none => firstSome cases (fun (_, body, _) => firstSome body firstSwitchFallthroughLoc)
+  | .ifElse _ t e _ =>
+      match firstSome t firstSwitchFallthroughLoc with
+      | some l => some l
+      | none => firstSome e firstSwitchFallthroughLoc
+  | .while_ _ b _ => firstSome b firstSwitchFallthroughLoc
+  | .for_ i _ _ b _ =>
+      match i with
+      | some s2 => (match firstSwitchFallthroughLoc s2 with
+          | some l => some l
+          | none => firstSome b firstSwitchFallthroughLoc)
+      | none => firstSome b firstSwitchFallthroughLoc
+  | .block ss _ => firstSome ss firstSwitchFallthroughLoc
+  | .doWhile b _ _ => firstSome b firstSwitchFallthroughLoc
+  | .label_ _ body _ => firstSwitchFallthroughLoc body
+  | _ => none
+
+/-- Verify one function body. FEL-67: a function is `degraded` (not
+    `verified`) when it uses `goto`/labels or has a switch case that can
+    fall through — both are real gaps in the structural analysis (FEL-43,
+    FEL-49 #3), and previously this status was computed but never
+    surfaced: `--verify-report` printed `verified (0 violations)` for such
+    a function regardless, and `ccc` exited 0. The `degradedBy` evidence
+    entries recorded here are what let the report name the actual
+    construct and line, not just say "degraded" with no reason. -/
 def verifyFunction (ctx : VerifyCtx) (f : Syntax.FunDef) : Syntax.FunVerifyResult :=
   let paramIdx := f.params.zipIdx.map (fun (p, i) => (p.name, i))
   let ctx := { ctx with currentFun := f.name, currentParamIndex := paramIdx }
   let initState := initFlowStateFromParams f.params
   let finalState := analyzeStmts ctx f.body initState
+  let gotoLoc? := firstSome f.body firstGotoLoc
+  let fallthroughLoc? := firstSome f.body firstSwitchFallthroughLoc
+  let degradeEvidence : List Syntax.SafetyEvidence :=
+    (match gotoLoc? with
+      | some l => [Syntax.SafetyEvidence.degradedBy "goto"
+          "function uses goto/labels; there is no general control-flow graph here, so hand-rolled control flow is not modelled" l]
+      | none => []) ++
+    (match fallthroughLoc? with
+      | some l => [Syntax.SafetyEvidence.degradedBy "switch-fallthrough"
+          "a switch case does not end in break/return/continue/goto; fall-through between cases is not modelled" l]
+      | none => [])
   let status : Syntax.VerifyStatus :=
-    if f.body.any stmtHasGoto then .degraded else .verified
+    if gotoLoc?.isSome || fallthroughLoc?.isSome then .degraded else .verified
   { funName := f.name
     status := status
     violations := finalState.violations
-    evidence := finalState.evidence }
+    evidence := finalState.evidence ++ degradeEvidence }
 
 /-- Verify all functions and produce a report. -/
 def verifyProgramReport (prog : Syntax.Program) : Syntax.ProgramVerifyResult :=
