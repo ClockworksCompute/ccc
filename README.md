@@ -182,14 +182,14 @@ lake env lean --run test/Phase2Features.lean       # 37/37 — language features
 lake env lean --run test/PreprocessTest.lean       # 14/14 — preprocessor
 lake env lean --run test/TypedefTest.lean          # 10/10 — typedef resolution
 lake env lean --run test/VerifierAccuracyTest.lean # 10/10 — false-positive guard
-lake env lean --run test/VerifierFixesTest.lean    # 28/28 — verifier soundness/precision regressions
+lake env lean --run test/VerifierFixesTest.lean    # 31/31 — verifier soundness/precision regressions
 lake env lean --run test/HardenTest.lean           #  7/7  — --harden runtime bounds checks
 lake env lean --run test/StructLayoutTest.lean     # 10/10 — struct alignment, sizeof(expr)
 lake env lean --run test/StackArgsTest.lean        #  6/6  — AAPCS64 stack args (>8 params)
 lake env lean --run test/GlobalArrayTest.lean      # 10/10 — global array declarations/initializers
 lake env lean --run test/EnumResolveTest.lean      # 11/11 — enum constant resolution
 lake env lean --run test/FuncPtrTest.lean          # 10/10 — function pointers / indirect calls
-lake env lean --run test/JsonReportTest.lean       #  4/4  — --report=json structured output
+lake env lean --run test/JsonReportTest.lean       #  5/5  — --report=json structured output
 lake env lean --run test/E2EAllDemos.lean          # demo programs
 
 bash test/regression/run_regressions.sh             # numbered CCC-BUG-NNN repros

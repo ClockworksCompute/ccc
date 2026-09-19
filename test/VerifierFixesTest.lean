@@ -88,6 +88,44 @@ def expectNotDegraded (name : String) (src : String) : IO Bool := do
         IO.println s!"✓ {name}: not degraded, as expected"
         pure true
 
+/-- FEL-65 epic DoD bullet 7 ("never call a skipped function verified"):
+    a function calling `setjmp` must be reported `.exempt` — verification
+    SKIPPED, not merely degraded, since the analysis's single-return
+    assumption is fundamentally wrong for it. -/
+def expectExempt (name : String) (src : String) : IO Bool := do
+  let pp ← preprocess src "."
+  match parseProgram pp with
+  | .error e =>
+      IO.eprintln s!"✗ {name}: parse error: {e.take 200}"
+      pure false
+  | .ok prog =>
+      let report := Verify.verifyProgramReport prog
+      let fns := report.results.filter (·.funName != "program")
+      if fns.any (·.status == .exempt) then
+        IO.println s!"✓ {name}: exempt, as expected"
+        pure true
+      else
+        IO.eprintln s!"✗ {name}: no function reported exempt — regression!"
+        pure false
+
+/-- The mirror check: an ordinary function with no `setjmp` call must NOT
+    be reported `.exempt`. -/
+def expectNotExempt (name : String) (src : String) : IO Bool := do
+  let pp ← preprocess src "."
+  match parseProgram pp with
+  | .error e =>
+      IO.eprintln s!"✗ {name}: parse error: {e.take 200}"
+      pure false
+  | .ok prog =>
+      let report := Verify.verifyProgramReport prog
+      let fns := report.results.filter (·.funName != "program")
+      if fns.any (·.status == .exempt) then
+        IO.eprintln s!"✗ {name}: a function was (wrongly) reported exempt — false-positive regression!"
+        pure false
+      else
+        IO.println s!"✓ {name}: not exempt, as expected"
+        pure true
+
 def main : IO UInt32 := do
   IO.println "═══ Verifier fixes regression suite (FEL-40..49) ═══"
   let mut pass : Nat := 0
@@ -410,6 +448,44 @@ def main : IO UInt32 := do
     ("int add(int a, int b) { return a + b; }\n" ++
      "typedef int (*op_t)(int, int);\n" ++
      "int main() {\n  op_t p = add;\n  return (*p)(3, 4);\n}\n")
+  then pass := pass + 1
+
+  -- FEL-65 epic DoD bullet 7: `.exempt` was designed (VerifyStatus's own
+  -- doc comment says "uses EXEMPT features (varargs, setjmp);
+  -- verification skipped") but NOTHING in the verifier ever actually
+  -- produced it, for any reason -- a function calling `setjmp` was
+  -- silently analysed as ordinary control flow and reported fully
+  -- `verified`, directly contradicting the epic's own bullet 7.
+  total := total + 1
+  if ← expectExempt "FEL65_setjmp_call_marks_function_exempt"
+    ("typedef struct { int x[8]; } jmp_buf;\n" ++
+     "int setjmp(jmp_buf env);\n" ++
+     "int risky(jmp_buf env, int x) {\n" ++
+     "  if (setjmp(env)) { return -1; }\n" ++
+     "  return x + 1;\n" ++
+     "}\n" ++
+     "int main() { jmp_buf jb; return risky(jb, 5); }\n")
+  then pass := pass + 1
+
+  -- setjmp nested inside an arbitrary expression (not just a bare `if`
+  -- condition) must also be found -- exercises the recursive expression
+  -- walk, not just the statement-level one.
+  total := total + 1
+  if ← expectExempt "FEL65_setjmp_nested_in_expression_marks_exempt"
+    ("typedef struct { int x[8]; } jmp_buf;\n" ++
+     "int setjmp(jmp_buf env);\n" ++
+     "int risky(jmp_buf env) {\n" ++
+     "  int r = 1 + setjmp(env);\n" ++
+     "  return r;\n" ++
+     "}\n" ++
+     "int main() { jmp_buf jb; return risky(jb); }\n")
+  then pass := pass + 1
+
+  -- An ordinary function with no setjmp call must NOT be marked exempt.
+  total := total + 1
+  if ← expectNotExempt "FEL65_ordinary_function_not_exempt"
+    ("int add(int a, int b) { return a + b; }\n" ++
+     "int main() { return add(2, 3); }\n")
   then pass := pass + 1
 
   IO.println s!"\n═══ Results: {pass}/{total} passed ═══"

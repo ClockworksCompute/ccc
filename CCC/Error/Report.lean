@@ -96,21 +96,31 @@ private def degradeReasonsFor (r : FunVerifyResult) : List String :=
     | .degradedBy _feature reason loc => some s!"{reason} (line {loc.line})"
     | _ => none)
 
-/-- FEL-67: list every `degraded` function with why, so a success report
-    never reads as an unqualified "0 memory safety violations" when some
-    function's control flow (goto, or a fall-through switch case) was not
-    actually analysed with full precision. Empty string when nothing to
-    report, so callers can append it unconditionally. -/
+/-- FEL-67 (extended for FEL-65 epic DoD bullet 7, "never call a skipped
+    function verified"): list every `degraded` OR `exempt` function with
+    why, so a success report never reads as an unqualified "0 memory
+    safety violations" when some function's control flow (goto, or a
+    fall-through switch case) was not actually analysed with full
+    precision (`degraded`), or was SKIPPED ENTIRELY (`exempt`: setjmp,
+    varargs) — the latter is strictly worse than the former, not milder,
+    and previously wasn't listed here at all. This only prints anything
+    at all when the caller reached this point via `--allow-degraded`
+    (Main.lean's gate blocks by default otherwise), which is exactly when
+    the stage banner above it still flatly says "Verified" / "Linked"
+    with no such caveat — this list is what keeps that claim honest.
+    Empty string when nothing to report, so callers can append it
+    unconditionally. -/
 def formatDegradedFunctions (result : ProgramVerifyResult) : String :=
-  let degraded := result.degradedFunctions
-  if degraded.isEmpty then ""
-  else
-    let lines := result.results.filter (·.isDegraded) |>.map (fun r =>
-      let reasons := degradeReasonsFor r
-      let reasonStr := if reasons.isEmpty then "reduced analysis precision"
-        else String.intercalate "; " reasons
-      s!"  ⚠ {r.funName}: DEGRADED ({reasonStr}) — not fully proven memory-safe")
-    "\n" ++ String.intercalate "\n" lines
+  let degradedLines := result.results.filter (·.isDegraded) |>.map (fun r =>
+    let reasons := degradeReasonsFor r
+    let reasonStr := if reasons.isEmpty then "reduced analysis precision"
+      else String.intercalate "; " reasons
+    s!"  ⚠ {r.funName}: DEGRADED ({reasonStr}) — not fully proven memory-safe")
+  let exemptLines := result.results.filter (·.isExempt) |>.map (fun r =>
+    s!"  ⚠ {r.funName}: EXEMPT — verification was SKIPPED ENTIRELY (setjmp/varargs), not proven memory-safe at all")
+  let lines := degradedLines ++ exemptLines
+  if lines.isEmpty then ""
+  else "\n" ++ String.intercalate "\n" lines
 
 /-- Format the success report for a safe program. Stage-truthful: only claims
     what was actually achieved. -/

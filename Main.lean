@@ -24,11 +24,12 @@ def usage : String :=
   "    Exits 0 iff `summary.safe` is true.\n" ++
   "  --allow-degraded: by default, ccc refuses to emit (exits 1) when any\n" ++
   "    function was analysed with reduced precision (`degraded`: it uses\n" ++
-  "    goto/labels, or has a switch case that can fall through) even if\n" ++
-  "    zero violations were found in what could be analysed — a degraded\n" ++
-  "    function was NOT proven memory-safe, and treating it the same as a\n" ++
-  "    fully verified one would be dishonest. Pass this flag to emit\n" ++
-  "    anyway; the degraded function(s) and why are still printed.\n" ++
+  "    goto/labels, or has a switch case that can fall through) OR had\n" ++
+  "    verification SKIPPED ENTIRELY (`exempt`: it calls setjmp) — even if\n" ++
+  "    zero violations were found in what could be analysed. Neither was\n" ++
+  "    proven memory-safe, and treating either the same as a fully\n" ++
+  "    verified function would be dishonest. Pass this flag to emit\n" ++
+  "    anyway; the degraded/exempt function(s) and why are still printed.\n" ++
   "  --harden: EXPERIMENTAL (FEL-59, in progress). Emit a binary even when\n" ++
   "    the verifier finds violations it cannot clear, with a loud warning\n" ++
   "    naming exactly what was not proven. Exit code stays 0. As of this\n" ++
@@ -157,7 +158,7 @@ def main (args : List String) : IO UInt32 := do
           let report := CCC.Verify.verifyProgramReport prog
           let reportJson := CCC.Error.programReportToJson filename report
           IO.println reportJson.compress
-          return (if report.isSafe then 0 else 1)
+          return (if CCC.Error.isFullyVerified report then 0 else 1)
   | _ => pure ()
 
   -- Strip any leading `--harden` / `--allow-degraded` flags, in either
@@ -207,22 +208,33 @@ def main (args : List String) : IO UInt32 := do
     IO.println "⚠️  finished) and can still misbehave exactly like an"
     IO.println "⚠️  unverified C program. Do not treat this as a safe binary."
 
-  -- FEL-67: a `degraded` function (goto/labels, or a switch case that can
-  -- fall through) was analysed with reduced precision and was NOT proven
-  -- memory-safe, even when zero violations were found in what CCC could
-  -- analyse. Previously this status was computed (`Verify.verifyFunction`)
-  -- but never surfaced anywhere the CLI actually looked: `--verify-report`
-  -- printed "verified (0 violations)" for such a function, and this gate
-  -- didn't exist at all, so `ccc` exited 0. Block by default, the same
-  -- way an actual violation blocks; `--allow-degraded` opts in explicitly.
-  let degradedFns : List CCC.Syntax.FunVerifyResult :=
+  -- FEL-67 (extended, FEL-65 epic DoD bullet 7: "never call a skipped
+  -- function verified"): a `degraded` function (goto/labels, or a switch
+  -- case that can fall through) was analysed with reduced precision and
+  -- was NOT proven memory-safe; an `exempt` function (setjmp, varargs) had
+  -- verification SKIPPED ENTIRELY -- strictly worse than degraded, not
+  -- milder. Both used to be invisible here: `--verify-report` printed
+  -- "verified (0 violations)" for either, the FEL-67 gate below originally
+  -- only checked `.degraded` (added FEL-67; `.exempt` was left out, an
+  -- oversight this closes), and the top-level success banner
+  -- (`Report.formatSuccess`) says "Verified: <name> (assembly generated)"
+  -- unconditionally whenever there happen to be zero violations, with no
+  -- awareness of status at all -- so an exempt function's caller still saw
+  -- the whole program pronounced "Verified". Block both by default, the
+  -- same way an actual violation blocks; `--allow-degraded` opts into
+  -- BOTH (there is no finer-grained flag yet -- a real distinction
+  -- between "reduced precision but attempted" and "skipped outright"
+  -- would need a second flag, left for whenever that granularity is
+  -- actually requested rather than added speculatively here).
+  let unverifiedFns : List CCC.Syntax.FunVerifyResult :=
     match result.verifyResult with
-    | some vr => vr.results.filter (fun r => r.funName != "program" && r.status == .degraded)
+    | some vr => vr.results.filter (fun r =>
+        r.funName != "program" && (r.status == .degraded || r.status == .exempt))
     | none => []
-  if !degradedFns.isEmpty && !allowDegraded then
+  if !unverifiedFns.isEmpty && !allowDegraded then
     IO.eprintln ""
-    IO.eprintln s!"ERROR: {degradedFns.length} function(s) were analysed with reduced precision (degraded) and were NOT proven memory-safe:"
-    for r in degradedFns do
+    IO.eprintln s!"ERROR: {unverifiedFns.length} function(s) were NOT fully verified (degraded or exempt):"
+    for r in unverifiedFns do
       IO.eprintln s!"  {formatFunReport r}"
     IO.eprintln "Pass --allow-degraded to compile anyway (these functions were not fully checked)."
     return 1

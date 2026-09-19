@@ -641,6 +641,56 @@ private partial def firstSwitchFallthroughLoc (s : Syntax.Stmt) : Option Syntax.
   | .label_ _ body _ => firstSwitchFallthroughLoc body
   | _ => none
 
+/-- Does this expression contain a call to `setjmp`/`sigsetjmp` anywhere,
+    however deeply nested (`if (setjmp(jb))`, `int r = setjmp(jb);`, a
+    bare `setjmp(jb);` statement — all real, common usages)? `setjmp`'s
+    control-flow semantics (one call site, potentially many returns, one
+    for the direct call and one per matching `longjmp`) are not a shape
+    the structural flow analysis models at all — a function using it was
+    designed to be reported `exempt` (`VerifyStatus.exempt`'s own doc
+    comment: "uses EXEMPT features (varargs, setjmp); verification
+    skipped"), but until this fix NOTHING in the verifier ever actually
+    produced `.exempt` for any function, for any reason — every function
+    using `setjmp` was silently analysed as if it were ordinary control
+    flow and reported fully `verified` regardless, directly contradicting
+    FEL-65's epic DoD bullet 7 ("never call a skipped function
+    verified"). -/
+private partial def exprCallsSetjmp (e : Syntax.Expr) : Bool :=
+  match e with
+  | .call fn args _ => fn == "setjmp" || fn == "sigsetjmp" || args.any exprCallsSetjmp
+  | .callFnPtr fn args _ => exprCallsSetjmp fn || args.any exprCallsSetjmp
+  | .binOp _ l r _ => exprCallsSetjmp l || exprCallsSetjmp r
+  | .unOp _ o _ => exprCallsSetjmp o
+  | .index a i _ => exprCallsSetjmp a || exprCallsSetjmp i
+  | .member o _ _ => exprCallsSetjmp o
+  | .arrow p _ _ => exprCallsSetjmp p
+  | .assign l r _ => exprCallsSetjmp l || exprCallsSetjmp r
+  | .ternary c t e2 _ => exprCallsSetjmp c || exprCallsSetjmp t || exprCallsSetjmp e2
+  | .cast _ o _ => exprCallsSetjmp o
+  | .comma l r _ => exprCallsSetjmp l || exprCallsSetjmp r
+  | .initList es _ => es.any exprCallsSetjmp
+  | .sizeOfExpr o _ => exprCallsSetjmp o
+  | .intLit _ _ | .charLit _ _ | .sizeOf _ _ | .strLit _ _ | .nullLit _ | .floatLit _ _ | .var _ _ => false
+
+private partial def stmtCallsSetjmp (s : Syntax.Stmt) : Bool :=
+  match s with
+  | .varDecl _ _ init _ => match init with | some e => exprCallsSetjmp e | none => false
+  | .exprStmt e _ => exprCallsSetjmp e
+  | .ret v _ => match v with | some e => exprCallsSetjmp e | none => false
+  | .ifElse c t e _ => exprCallsSetjmp c || t.any stmtCallsSetjmp || e.any stmtCallsSetjmp
+  | .while_ c b _ => exprCallsSetjmp c || b.any stmtCallsSetjmp
+  | .for_ i c st b _ =>
+      (match i with | some s2 => stmtCallsSetjmp s2 | none => false) ||
+      (match c with | some e => exprCallsSetjmp e | none => false) ||
+      (match st with | some e => exprCallsSetjmp e | none => false) ||
+      b.any stmtCallsSetjmp
+  | .block ss _ => ss.any stmtCallsSetjmp
+  | .switch_ scrut cases _ =>
+      exprCallsSetjmp scrut || cases.any (fun (_, body, _) => body.any stmtCallsSetjmp)
+  | .doWhile b c _ => b.any stmtCallsSetjmp || exprCallsSetjmp c
+  | .label_ _ body _ => stmtCallsSetjmp body
+  | .break_ _ | .continue_ _ | .goto_ _ _ | .emptyStmt _ => false
+
 /-- Verify one function body. FEL-67: a function is `degraded` (not
     `verified`) when it uses `goto`/labels or has a switch case that can
     fall through — both are real gaps in the structural analysis (FEL-43,
@@ -648,7 +698,20 @@ private partial def firstSwitchFallthroughLoc (s : Syntax.Stmt) : Option Syntax.
     surfaced: `--verify-report` printed `verified (0 violations)` for such
     a function regardless, and `ccc` exited 0. The `degradedBy` evidence
     entries recorded here are what let the report name the actual
-    construct and line, not just say "degraded" with no reason. -/
+    construct and line, not just say "degraded" with no reason.
+
+    FEL-65 epic DoD bullet 7 follow-up: a function calling `setjmp` is
+    `exempt` (verification skipped, not merely degraded) — worse than
+    `degraded`, not milder, since the structural analysis's single-return
+    assumption is fundamentally wrong for it, not just imprecise.
+    `exempt` wins over `degraded` when a function has both (matches
+    `ProgramVerifyResult.worstStatus`'s existing ordering). Variadic
+    FUNCTION DEFINITIONS (as opposed to variadic external declarations,
+    which already parse fine) are a separate, larger, pre-existing gap —
+    `int f(int n, ...) { ... }` isn't correctly parsed at all today (its
+    `...` parameter is dropped, corrupting arity checking), so there is
+    no function-level `isVariadic` flag yet to exempt on; not attempted
+    here. -/
 def verifyFunction (ctx : VerifyCtx) (f : Syntax.FunDef) : Syntax.FunVerifyResult :=
   let paramIdx := f.params.zipIdx.map (fun (p, i) => (p.name, i))
   let ctx := { ctx with currentFun := f.name, currentParamIndex := paramIdx }
@@ -665,12 +728,20 @@ def verifyFunction (ctx : VerifyCtx) (f : Syntax.FunDef) : Syntax.FunVerifyResul
       | some l => [Syntax.SafetyEvidence.degradedBy "switch-fallthrough"
           "a switch case does not end in break/return/continue/goto; fall-through between cases is not modelled" l]
       | none => [])
+  let usesSetjmp : Bool := f.body.any stmtCallsSetjmp
   let status : Syntax.VerifyStatus :=
-    if gotoLoc?.isSome || fallthroughLoc?.isSome then .degraded else .verified
+    if usesSetjmp then .exempt
+    else if gotoLoc?.isSome || fallthroughLoc?.isSome then .degraded
+    else .verified
+  let exemptEvidence : List Syntax.SafetyEvidence :=
+    if usesSetjmp then
+      [Syntax.SafetyEvidence.exemptedBy "setjmp"
+        "function calls setjmp; its multiple-return control flow is not modelled at all" f.loc]
+    else []
   { funName := f.name
     status := status
     violations := finalState.violations
-    evidence := finalState.evidence ++ degradeEvidence }
+    evidence := finalState.evidence ++ degradeEvidence ++ exemptEvidence }
 
 /-- Verify all functions and produce a report. -/
 def verifyProgramReport (prog : Syntax.Program) : Syntax.ProgramVerifyResult :=

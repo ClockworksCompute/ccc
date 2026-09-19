@@ -90,6 +90,26 @@ def main : IO UInt32 := do
     else
       IO.eprintln s!"✗ json_degraded_function: output: {out}"
 
+  -- FEL-65 epic DoD bullet 7: an exempt function (setjmp) must show up
+  -- with status "exempt" and summary.safe:false, and the whole program
+  -- must exit 1 by default (matching the CLI gate) -- never silently
+  -- reported "safe" just because zero violations were found in what
+  -- COULD be checked.
+  total := total + 1
+  do
+    let path ← writeTmp "exempt"
+      ("typedef struct { int x[8]; } jmp_buf;\n" ++
+       "int setjmp(jmp_buf env);\n" ++
+       "int risky(jmp_buf env) {\n  if (setjmp(env)) return -1;\n  return 1;\n}\n" ++
+       "int main() { jmp_buf jb; return risky(jb); }\n")
+    let (code, out) ← ccJson #["--report=json", path]
+    let ok := code == 1 && containsStr out "\"status\":\"exempt\"" && containsStr out "\"safe\":false"
+    if ok then
+      IO.println "✓ json_exempt_function: exit 1, status exempt, safe:false"
+      pass := pass + 1
+    else
+      IO.eprintln s!"✗ json_exempt_function: exit {code}, output: {out}"
+
   IO.println ""
   IO.println "═══════════════════════════════════════════"
   IO.println s!"  JSON report tests: {pass}/{total} passed"
