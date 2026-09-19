@@ -182,7 +182,7 @@ lake env lean --run test/Phase2Features.lean       # 37/37 — language features
 lake env lean --run test/PreprocessTest.lean       # 14/14 — preprocessor
 lake env lean --run test/TypedefTest.lean          # 10/10 — typedef resolution
 lake env lean --run test/VerifierAccuracyTest.lean # 10/10 — false-positive guard
-lake env lean --run test/VerifierFixesTest.lean    # 31/31 — verifier soundness/precision regressions
+lake env lean --run test/VerifierFixesTest.lean    # 34/34 — verifier soundness/precision regressions
 lake env lean --run test/HardenTest.lean           #  7/7  — --harden runtime bounds checks
 lake env lean --run test/StructLayoutTest.lean     # 10/10 — struct alignment, sizeof(expr)
 lake env lean --run test/StackArgsTest.lean        #  6/6  — AAPCS64 stack args (>8 params)
@@ -215,12 +215,14 @@ scripts/corpus.sh
 ```
 
 Baseline status (see [`docs/corpus-results.md`](./docs/corpus-results.md)
-for the full writeup): **0 of 4 entries detected.** `libwebp-cve-2023-4863`
-and `libpng-cve-2015-8126` are **missed** — `ccc` accepts both the
-vulnerable and fixed versions outright, since the verifier does not yet
-track integer overflow, nor relate a fixed-capacity buffer to a loop
-bound that is an ordinary (unbounded) parameter. The other two
-(`libheif-overlay-85e21ad`, `libpng-cve-2018-13785`) are
+for the full writeup): **1 of 4 entries detected** (`libpng-cve-2015-8126`
+— a fixed-capacity buffer written in a loop bounded by an ordinary,
+unbounded parameter, caught by a real fix to the loop-fixpoint analysis's
+missing widening step; verified sound against its own `must-reject/`
+mutants and the mutation/generated fuzzers). `libwebp-cve-2023-4863` is
+**missed** — `ccc` accepts both the vulnerable and fixed versions
+outright, since the verifier does not yet track integer overflow. The
+other two (`libheif-overlay-85e21ad`, `libpng-cve-2018-13785`) are
 **false-positive** — `ccc` rejects the vulnerable version, but rejects
 the fixed version identically, unable to relate a runtime clamp/bounds
 check to the buffer it protects. This is not a typo or an oversight — the

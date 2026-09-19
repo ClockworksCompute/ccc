@@ -1,5 +1,67 @@
 # CVE regression corpus — baseline results
 
+## 2026-09-19 (sixth update) — libpng-cve-2015-8126 DETECTED: fixed a real
+## missing-widening bug in the loop-fixpoint analysis (FEL-76)
+
+**Against commit:** (pending, this branch) on `main`.
+
+The fifth update below reclassified this entry `false-positive` →
+`missed` after removing an incidental null-check masking issue. That
+unmasked a general, previously-undocumented soundness gap, traced and
+fixed properly this update — **not a heuristic, a root-caused bug fix**,
+following the exact rigor this project's own FEL-64 history demands.
+
+**Root cause**: `CCC/Verify/Verify.lean`'s `fixpointBody` approximates a
+loop's effect with a bounded number of warm-up rounds (3, plus one final
+real pass) rather than a true fixpoint. For a loop counter whose range
+keeps growing round after round with no independent way to tighten it
+from the condition (`for (i=0;i<n;i++)` where `n` is an ordinary,
+unbounded parameter — unlike `i<10` against a literal, which is
+re-derived fresh from the condition every single pass and never depended
+on this), the per-round union just grows by the step's fixed increment
+and then FREEZES the moment fuel runs out, treating whatever value it
+happened to reach as if it were a real proof. `arr[i]` inside such a loop
+was accepted with a `runtime-bounded` verdict and confirmed to genuinely
+overflow under `cc -fsanitize=address`.
+
+**Fix**: a standard abstract-interpretation widening step
+(`widenUnstableRanges`), applied after every fixpoint round — any
+tracked range whose bound CHANGED since the previous round hasn't
+converged within the available fuel, so that side is now correctly
+treated as unknown rather than trusted at whatever value fuel exhaustion
+cut it off at. A range that stabilizes after one round (the overwhelming
+majority of loop-invariant facts) is completely unaffected.
+
+**Verification, following the FEL-76 ticket's own stated bar exactly**:
+- Full regression suite (34/34 in `VerifierFixesTest.lean`, all other
+  suites) — zero regressions. A literal-bounded loop
+  (`for(i=0;i<10;i++)`) still verifies clean, confirming the fix only
+  affects the unbounded-parameter case, not the common, already-sound one.
+- `scripts/mutation_fuzz.py`: the 2 mutants this entry's `fixed.c`
+  produced (found by the fuzzer itself, before this fix, while the entry
+  was `missed`) are now both correctly `caught`, zero unsound.
+- `scripts/generated_fuzz.py` (200 iterations): the `local_array` and
+  `struct_field_array` templates — the exact shapes this fix targets,
+  where the array's capacity is visible WITHIN the same function as the
+  loop — now show **zero** soundness findings (previously ~1 in 6). The
+  `heap_array`/`copy_loop` templates still show findings, but tracing one
+  down confirms this is a SEPARATE, already-scoped gap (FEL-58:
+  interprocedural capacity tracking — a `malloc`'d pointer's known size
+  doesn't cross a function-call boundary into a callee's own parameter),
+  not a gap in this fix: the identical access checked WITHOUT crossing a
+  call boundary correctly reports "Index may exceed array bounds
+  (capacity=10, required<20)".
+
+**Scoreboard**: `libpng-cve-2015-8126` is now **detected** (rejects the
+vulnerable version at the real bug's line, accepts the fixed version,
+and rejects every file under its own `must-reject/` — the two mutants
+`scripts/mutation_fuzz.py` found earlier). First real corpus detection
+since the FEL-64 unsound heuristic was removed. Current scoreboard:
+**1/4 detected, 1 missed (`libwebp-cve-2023-4863`, integer-overflow
+class), 2 false-positive (`libheif-overlay-85e21ad`,
+`libpng-cve-2018-13785`, both needing relational reasoning this fix
+doesn't provide)**.
+
 ## 2026-09-19 (fifth update) — libpng-cve-2015-8126 reclassified
 ## false-positive → missed: an incidental null-deref masked the real test
 

@@ -488,6 +488,54 @@ def main : IO UInt32 := do
      "int main() { return add(2, 3); }\n")
   then pass := pass + 1
 
+  -- FEL-76: a fixed-capacity array parameter indexed inside a loop
+  -- bounded by an ORDINARY, unbounded parameter used to be silently
+  -- ACCEPTED with a `runtime-bounded` verdict -- confirmed with `cc
+  -- -fsanitize=address` to genuinely heap/stack-overflow. Root cause: the
+  -- bounded-fuel loop fixpoint (CCC/Verify/Verify.lean's `fixpointBody`)
+  -- had no WIDENING step, so a loop counter's carried-forward range just
+  -- grew by the step's fixed increment each round and FROZE at whatever
+  -- value it reached when fuel ran out, instead of correctly recognizing
+  -- non-convergence and treating the bound as unknown. Fixed by
+  -- `widenUnstableRanges`, applied every fixpoint round.
+  total := total + 1
+  if ← expectCaught "FEL76_array_param_indexed_by_unbounded_param_loop"
+    ("void fill(int arr[10], int n) {\n" ++
+     "  int i;\n" ++
+     "  for (i = 0; i < n; i = i + 1) { arr[i] = i; }\n" ++
+     "}\n" ++
+     "int main() {\n  int arr[10];\n  fill(arr, 20);\n  return arr[0];\n}\n")
+  then pass := pass + 1
+
+  -- Same shape through a struct-field array via a pointer parameter
+  -- (`s->arr[i]`), not just a plain array parameter -- confirms the fix
+  -- isn't specific to one syntactic form of "known in-function capacity".
+  total := total + 1
+  if ← expectCaught "FEL76_struct_field_array_indexed_by_unbounded_param_loop"
+    ("struct S { int arr[10]; };\n" ++
+     "void fill(struct S *s, int n) {\n" ++
+     "  int i;\n" ++
+     "  for (i = 0; i < n; i = i + 1) { s->arr[i] = i; }\n" ++
+     "}\n" ++
+     "int main() {\n  struct S s;\n  fill(&s, 20);\n  return s.arr[0];\n}\n")
+  then pass := pass + 1
+
+  -- The exact false-positive/regression risk this fix must NOT introduce:
+  -- an ordinary loop bounded by a LITERAL matching the array's own real
+  -- capacity must still verify clean -- this is re-derived fresh from the
+  -- condition every iteration (`inferExprBoundFromCond`/
+  -- `inferTransitiveBounds`, applied at loop-body entry), not from the
+  -- cross-iteration carried-forward range the widening fix touches, so it
+  -- must be completely unaffected.
+  total := total + 1
+  if ← expectClean "FEL76_literal_bounded_loop_still_verifies"
+    ("void fill(int arr[10]) {\n" ++
+     "  int i;\n" ++
+     "  for (i = 0; i < 10; i = i + 1) { arr[i] = i; }\n" ++
+     "}\n" ++
+     "int main() {\n  int arr[10];\n  fill(arr);\n  return arr[0];\n}\n")
+  then pass := pass + 1
+
   IO.println s!"\n═══ Results: {pass}/{total} passed ═══"
   if pass == total then
     IO.println "All verifier-fixes regression tests passed!"

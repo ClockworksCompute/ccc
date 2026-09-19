@@ -216,6 +216,52 @@ private def silently (f : FlowState → FlowState) (st : FlowState) : FlowState 
 private def mergeStateOnly (a b : FlowState) : FlowState :=
   { FlowState.merge a b with violations := a.violations, evidence := a.evidence }
 
+/-- FEL-76: a real, ASan-confirmed soundness bug traced to a missing
+    WIDENING step here. `IRange.merge` (used by `mergeStateOnly` every
+    round) takes a plain union of two known bounds — sound for a single
+    merge, but the fixpoint warm-up loop below runs a FIXED, bounded
+    number of rounds (`fuel`), not a true fixpoint. For a loop counter
+    whose range keeps genuinely growing round after round (`for (i=0;
+    i<n;i++)` where `n` is an ordinary, unbounded parameter — the
+    condition itself gives `i` no independent tightening the way `i<10`
+    against a literal would, so `i`'s carried-forward range is all
+    there is), the union just grows by however much the loop body's
+    step changes it, and then FREEZES at whatever value it reached the
+    moment `fuel` runs out — a false, arbitrary finite bound (e.g. `hi=4`
+    after 3 warm-up rounds + 1 final pass) gets silently treated as if
+    it were a real proof, when the loop can genuinely run any number of
+    times. `arr[i]` inside such a loop, where `arr`'s real capacity is
+    smaller than the loop could actually reach, was accepted with a
+    `runtime-bounded` verdict and confirmed to genuinely heap-overflow
+    under `cc -fsanitize=address`.
+
+    This is a standard abstract-interpretation widening operator: for any
+    range key whose value CHANGED between this round and the last, the
+    loop hasn't converged within the fuel available — assume that side
+    is UNKNOWN (not "whatever it happened to reach") rather than keep
+    trusting a value fuel exhaustion cut off arbitrarily. A key that
+    genuinely stabilizes after one round (the overwhelmingly common case
+    — most loop-invariant facts settle immediately) is completely
+    unaffected: its value doesn't change round to round, so nothing here
+    touches it. This does not change behaviour for a loop bounded by a
+    LITERAL or otherwise-independently-known value (`for (i=0;i<10;
+    i++)`): that case is already re-derived fresh from the condition at
+    the START of every body pass (`inferExprBoundFromCond`/
+    `inferTransitiveBounds`, applied to `bodyStart` in `.for_`'s handling
+    below) and overrides whatever the carried-forward `bounds` entry
+    says regardless of this widening — only a range with NO independent
+    per-iteration tightening (exactly the unbounded-parameter case) ever
+    depends on what this function does. -/
+private def widenUnstableRanges (before after : FlowState) : FlowState :=
+  let widened := after.bounds.map (fun (k, r) =>
+    match before.bounds.find? (·.1 == k) with
+    | none => (k, r)  -- newly introduced this round; nothing to compare yet
+    | some (_, prevR) =>
+        let hi' := if r.hi == prevR.hi then r.hi else none
+        let lo' := if r.lo == prevR.lo then r.lo else none
+        (k, ({ lo := lo', hi := hi' } : IRange)))
+  { after with bounds := widened }
+
 /-- Iterate `oneIter` (one full loop-body pass, entry state → exit state)
     towards a fixpoint approximation, then run one real, violation-keeping
     pass from the settled state. `entry` must already carry every violation
@@ -227,7 +273,8 @@ private partial def fixpointBody (oneIter : FlowState → FlowState) (entry : Fl
     | 0 => cur
     | n' + 1 =>
         let afterSilent := silently oneIter cur
-        settle (mergeStateOnly cur afterSilent) n'
+        let merged := mergeStateOnly cur afterSilent
+        settle (widenUnstableRanges cur merged) n'
   let settled := settle entry fuel
   let finalAfter := oneIter settled
   { FlowState.merge settled finalAfter with

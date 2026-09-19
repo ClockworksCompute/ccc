@@ -6,6 +6,12 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+- A fixed-capacity array (or struct-field array) indexed inside a loop bounded by an ordinary, unbounded parameter (`void fill(int arr[10], int n) { for (i=0;i<n;i++) arr[i]=i; }`) was silently accepted with a `runtime-bounded` verdict and zero violations — confirmed with `cc -fsanitize=address` to genuinely overflow. Root cause: the loop-fixpoint analysis's bounded-fuel warm-up loop had no widening step, so a loop counter's carried-forward range just grew by the step's fixed increment each round and froze at whatever value it reached when fuel ran out, instead of correctly recognizing non-convergence and treating the bound as unknown. Fixed with a standard abstract-interpretation widening operator; an ordinary loop bounded by a literal (or otherwise independently-known value) is completely unaffected, since that case is already re-derived fresh from the condition every iteration. This is the first genuinely new corpus detection since the FEL-64 unsound heuristic was removed — `libpng-cve-2015-8126` (CVE-2015-8126) now scores `detected` rather than `missed`, verified against its own `must-reject/` mutants and both fuzzers.
+
+### Added
+- 3 new cases in `test/VerifierFixesTest.lean` (now 34) for the loop-widening fix, including a regression guard confirming a literal-bounded loop still verifies clean.
+
 ## [0.3.0] - 2026-09-19
 
 ### Fixed
