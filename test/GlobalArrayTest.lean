@@ -152,6 +152,51 @@ def main : IO UInt32 := do
     42
   then pass := pass + 1
 
+  -- FEL-68 follow-up: a string-literal initializer for a global char
+  -- array with NO explicit size (`char msg[] = "hi";`). This used to
+  -- register the symbol with no initializer at all -- `[]` decays to a
+  -- bare 8-byte pointer slot left uninitialized in BSS, so EVERY access
+  -- through it dereferenced garbage and segfaulted, while CCC's own
+  -- verifier still reported the function "verified". The size must be
+  -- deduced as strlen+1 (for the implicit NUL terminator).
+  total := total + 1
+  if ← expectExit "global_string_lit_no_size"
+    "char msg[] = \"hi\";\nint main() { return msg[0] - 'h' + (msg[2] == 0); }\n"
+    1
+  then pass := pass + 1
+
+  -- An explicit size larger than the string: C zero-pads the remainder,
+  -- exactly like a brace initializer's trailing elements.
+  total := total + 1
+  if ← expectExit "global_string_lit_explicit_size_zero_padded"
+    "char msg[10] = \"hi\";\nint main() { return msg[0] + msg[1] + msg[2] + msg[9]; }\n"
+    209
+  then pass := pass + 1
+
+  -- Cross-check directly against `cc` compiling the IDENTICAL source.
+  total := total + 1
+  do
+    let src := "char msg[] = \"hi\";\nint main() { return msg[0] - 'h' + (msg[2] == 0); }\n"
+    match ← globalArrCompileToArm src with
+    | .error e => IO.eprintln s!"✗ global_string_lit_matches_cc: compile error: {e}"
+    | .ok asm =>
+        try
+          let cccExit ← globalArrAssembleAndRun asm "global_string_lit_matches_cc"
+          let srcPath := "/tmp/ccc_globalarr_strlit_cc_ref.c"
+          let ccBin := "/tmp/ccc_globalarr_strlit_cc_ref_bin"
+          IO.FS.writeFile srcPath src
+          let ccCompile ← IO.Process.output { cmd := "cc", args := #["-o", ccBin, srcPath] }
+          if ccCompile.exitCode != 0 then
+            IO.eprintln s!"✗ global_string_lit_matches_cc: cc failed to compile the reference:\n{ccCompile.stderr}"
+          else
+            let ccRun ← IO.Process.output { cmd := ccBin, args := #[] }
+            if cccExit == ccRun.exitCode then
+              IO.println s!"✓ global_string_lit_matches_cc: CCC={cccExit}, cc={ccRun.exitCode} (agree)"
+              pass := pass + 1
+            else
+              IO.eprintln s!"✗ global_string_lit_matches_cc: CCC={cccExit}, cc={ccRun.exitCode} (disagree!)"
+        catch e => IO.eprintln s!"✗ global_string_lit_matches_cc: {e}"
+
   IO.println ""
   IO.println "═══════════════════════════════════════════"
   IO.println s!"  Global array tests: {pass}/{total} passed"

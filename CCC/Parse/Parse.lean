@@ -1242,15 +1242,46 @@ partial def parseFunDefOrProto : Parser (Option FunDef) := do
           isExtern := false, isStatic := false, loc := startTok.loc
         } :: st.pendingGlobals }
       else
-        -- A non-brace array initializer (e.g. `char msg[] = "hi";`, a
-        -- string literal) isn't captured as a real initializer yet —
-        -- register the SYMBOL with the right size (so it isn't dropped,
-        -- the more severe half of this bug) and skip past the value.
-        let _ ← skipToSemicolon
-        modify fun st => { st with pendingGlobals := {
-          name := name, ty := arrTy, init := none,
-          isExtern := false, isStatic := false, loc := startTok.loc
-        } :: st.pendingGlobals }
+        match initTok.kind with
+        | .stringLit s =>
+            -- FEL-68: `char msg[] = "hi";` / `char msg[8] = "hi";` — a
+            -- string-literal initializer for a char array. This used to
+            -- register the symbol with NO initializer and skip past the
+            -- string, which is worse than a wrong-values bug: `[]` with
+            -- no explicit size parses (via `parseArraySuffix`) as
+            -- `.pointer elem`, an 8-byte POINTER slot with no target,
+            -- left uninitialized in BSS — every access through it
+            -- dereferences garbage and segfaults, while CCC's own
+            -- verifier reports the function "verified". C deduces the
+            -- array size from the string length + 1 (for the implicit
+            -- NUL terminator) when no explicit size was written; an
+            -- explicit size is kept as declared and C's usual
+            -- zero-padding (already implemented for brace initializers
+            -- above) covers any bytes past the string. Reuses that same
+            -- `.initList` global-array emission path — a string literal
+            -- becomes exactly the same shape as `{ 'h', 'i', 0 }` would.
+            let _ ← advance
+            let _ ← expectKind .semi "';'"
+            let bytes := s.toList
+            let elems := (bytes.map (fun c => Expr.charLit c initTok.loc)) ++
+              [Expr.charLit (Char.ofNat 0) initTok.loc]
+            let finalArrTy := match arrTy with
+              | .pointer e => .array e elems.length
+              | other => other
+            modify fun st => { st with pendingGlobals := {
+              name := name, ty := finalArrTy, init := some (.initList elems initTok.loc),
+              isExtern := false, isStatic := false, loc := startTok.loc
+            } :: st.pendingGlobals }
+        | _ =>
+            -- Any other non-brace array initializer isn't captured as a
+            -- real initializer yet — register the SYMBOL with the right
+            -- size (so it isn't dropped, the more severe half of the
+            -- original bug this branch fixed) and skip past the value.
+            let _ ← skipToSemicolon
+            modify fun st => { st with pendingGlobals := {
+              name := name, ty := arrTy, init := none,
+              isExtern := false, isStatic := false, loc := startTok.loc
+            } :: st.pendingGlobals }
     else
       let _ ← expectKind .semi "';'"
       modify fun st => { st with pendingGlobals := {
