@@ -35,14 +35,15 @@ def usage : String :=
   "    build, every `base[index]` subscript through a pointer-typed base\n" ++
   "    (a heap allocation or a parameter) gets a runtime bounds check,\n" ++
   "    against a size registry populated by ccc_malloc/ccc_calloc, and\n" ++
-  "    aborts instead of corrupting memory when it fires. That check only\n" ++
-  "    protects an access whose base is exactly a tracked allocation's own\n" ++
-  "    pointer VALUE — the registry does an exact-address match, so ANY\n" ++
-  "    pointer arithmetic in between (`row = p + y*stride; row[x]`) yields\n" ++
-  "    an untracked address and the check silently no-ops for it. Also NOT\n" ++
-  "    covered at all: struct field arrow/dot access, and bare pointer\n" ++
-  "    dereference (`*p`). All of those stay exactly as unprotected as\n" ++
-  "    without --harden. Do not treat this as a complete hardening mode.\n" ++
+  "    aborts instead of corrupting memory when it fires. The registry\n" ++
+  "    lookup is RANGE-based, so an interior pointer produced by pointer\n" ++
+  "    arithmetic (`row = p + y*stride; row[x]`) is checked too, not just\n" ++
+  "    an exact match on a tracked allocation's own starting address. NOT\n" ++
+  "    covered at all: struct field arrow/dot access, bare pointer\n" ++
+  "    dereference (`*p`), and a negative index through an interior\n" ++
+  "    pointer that would still land inside the same allocation. All of\n" ++
+  "    those stay exactly as unprotected as without --harden. Do not\n" ++
+  "    treat this as a complete hardening mode.\n" ++
   "  If no -o specified, only verify (no assembly/linking)."
 
 /-- Find the runtime source file relative to the executable. -/

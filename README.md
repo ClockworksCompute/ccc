@@ -183,7 +183,7 @@ lake env lean --run test/PreprocessTest.lean       # 14/14 — preprocessor
 lake env lean --run test/TypedefTest.lean          # 10/10 — typedef resolution
 lake env lean --run test/VerifierAccuracyTest.lean # 10/10 — false-positive guard
 lake env lean --run test/VerifierFixesTest.lean    # 28/28 — verifier soundness/precision regressions
-lake env lean --run test/HardenTest.lean           #  5/5  — --harden runtime bounds checks
+lake env lean --run test/HardenTest.lean           #  7/7  — --harden runtime bounds checks
 lake env lean --run test/StructLayoutTest.lean     # 10/10 — struct alignment, sizeof(expr)
 lake env lean --run test/StackArgsTest.lean        #  6/6  — AAPCS64 stack args (>8 params)
 lake env lean --run test/GlobalArrayTest.lean      # 10/10 — global array declarations/initializers

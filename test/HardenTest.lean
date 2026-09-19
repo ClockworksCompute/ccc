@@ -121,6 +121,34 @@ def main : IO UInt32 := do
      "  return use(buf);\n}")
   then pass := pass + 1
 
+  -- FEL-59 follow-up: an INTERIOR pointer (`row = p + offset; row[i];`)
+  -- used to go completely unchecked -- the registry only matched an
+  -- allocation's OWN starting address exactly, and `row`'s address is
+  -- never itself registered. Confirmed to genuinely heap-overflow under
+  -- `cc -fsanitize=address` (a real bug, not just a theoretical gap).
+  -- Fixed by making the registry lookup range-based (does `row`'s
+  -- address fall WITHIN some tracked allocation's byte range) instead
+  -- of an exact match.
+  total := total + 1
+  if ← expectAbort "harden_catches_interior_pointer_overrun"
+    ("int main() {\n" ++
+     "  unsigned char *p = malloc(16);\n" ++
+     "  unsigned char *row = p + 10;\n" ++
+     "  row[10] = 1;\n" ++  -- p[20]: 4 bytes past the 16-byte allocation
+     "  return 0;\n}")
+  then pass := pass + 1
+
+  -- The same interior-pointer shape, but genuinely in bounds -- must NOT
+  -- be falsely flagged.
+  total := total + 1
+  if ← expectExit "harden_allows_interior_pointer_in_bounds"
+    ("int main() {\n" ++
+     "  unsigned char *p = malloc(16);\n" ++
+     "  unsigned char *row = p + 10;\n" ++
+     "  row[5] = 7;\n" ++  -- p[15]: last valid byte of the 16-byte allocation
+     "  return row[5];\n}") 7
+  then pass := pass + 1
+
   IO.println s!"\n═══ Results: {pass}/{total} passed ═══"
   if pass == total then
     IO.println "All --harden regression tests passed!"
