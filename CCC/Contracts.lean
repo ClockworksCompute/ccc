@@ -24,7 +24,7 @@ structure VerifiedProgram where
 
 namespace VerifierOnly
 
-/-- Trusted constructor used by verifier implementation and emitter unit tests.
+/-- Trusted constructor used internally by `verifyProgram` below.
     Requires proof that the report is safe. -/
 def mkVerified (prog : Syntax.Program) (evidence : Syntax.ProgramVerifyResult)
     (_h : evidence.isSafe = true) : VerifiedProgram :=
@@ -32,11 +32,11 @@ def mkVerified (prog : Syntax.Program) (evidence : Syntax.ProgramVerifyResult)
 
 end VerifierOnly
 
-/-- Parser contract. Implemented by CCC01. -/
+/-- Parser contract. -/
 def parseSource (source : String) : Except String Syntax.Program :=
   Parse.parseProgram source
 
-/-- Verifier contract. Implemented by CCC02.
+/-- Verifier contract.
     Returns VerifiedProgram on success, or violations on failure. -/
 def verifyProgram (prog : Syntax.Program)
     : Except (List Syntax.SafetyViolation) VerifiedProgram := do

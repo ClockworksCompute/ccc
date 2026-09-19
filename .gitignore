@@ -1,6 +1,2 @@
 .lake
-.gate_staging/
-claims/
-bugs/
-docs/bugs/
 .claude/worktrees/

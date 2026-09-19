@@ -23,6 +23,9 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `test/regression/PreprocessErrorRepro.lean` (2 checks) for the `#error` fix above: an active `#error` fails compilation with the message surfaced, and one inside an untaken `#if 0` branch correctly does not fire.
 - 2 new cases in `test/VerifierFixesTest.lean` (now 48) for the `sizeof(localVar)`/malloc-capacity fix above: a genuinely out-of-bounds access through the result is now caught, and the precise capacity resolved (not some other coincidentally-rejecting value) is confirmed by a matching in-bounds access staying clean.
 
+### Removed
+- FEL-53: 116 `panic!` stub files (`CCC/Features/*`, 25 features × Parse/Verify/Lower/Test; `CCC/Backend/*`, 4 targets × Regs/ABI/Select/Emit) and the unused `CCC/IR/IR.lean` they existed only to import, plus their 117 import lines in `CCC.lean`. Confirmed unreferenced by anything outside themselves (no test, script, or real codepath touched them) before deleting. A clean build now compiles 62 jobs instead of 296 (~35% less wall-clock time locally: 2:07 → 1:22) — none of this code ever ran, it only made every build (including CI's) pay to typecheck it. Also dropped stale `.gitignore` entries (`claims/`, `bugs/`, `docs/bugs/`, `.gate_staging/`) left over from before this became its own repo, and fixed two stale doc references in `CCC/Contracts.lean` ("Implemented by CCC01"/"CCC02" agent-ID comments, and a docstring mentioning "emitter unit tests" that don't exist).
+
 ## [0.3.0] - 2026-09-19
 
 ### Fixed
