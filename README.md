@@ -182,7 +182,7 @@ lake env lean --run test/Phase2Features.lean       # 37/37 — language features
 lake env lean --run test/PreprocessTest.lean       # 14/14 — preprocessor
 lake env lean --run test/TypedefTest.lean          # 10/10 — typedef resolution
 lake env lean --run test/VerifierAccuracyTest.lean # 10/10 — false-positive guard
-lake env lean --run test/VerifierFixesTest.lean    # 34/34 — verifier soundness/precision regressions
+lake env lean --run test/VerifierFixesTest.lean    # 38/38 — verifier soundness/precision regressions
 lake env lean --run test/HardenTest.lean           #  7/7  — --harden runtime bounds checks
 lake env lean --run test/StructLayoutTest.lean     # 10/10 — struct alignment, sizeof(expr)
 lake env lean --run test/StackArgsTest.lean        #  6/6  — AAPCS64 stack args (>8 params)
@@ -215,19 +215,27 @@ scripts/corpus.sh
 ```
 
 Baseline status (see [`docs/corpus-results.md`](./docs/corpus-results.md)
-for the full writeup): **1 of 4 entries detected** (`libpng-cve-2015-8126`
+for the full writeup): **2 of 4 entries detected.** `libpng-cve-2015-8126`
 — a fixed-capacity buffer written in a loop bounded by an ordinary,
-unbounded parameter, caught by a real fix to the loop-fixpoint analysis's
-missing widening step; verified sound against its own `must-reject/`
-mutants and the mutation/generated fuzzers). `libwebp-cve-2023-4863` is
-**missed** — `ccc` accepts both the vulnerable and fixed versions
-outright, since the verifier does not yet track integer overflow. The
-other two (`libheif-overlay-85e21ad`, `libpng-cve-2018-13785`) are
-**false-positive** — `ccc` rejects the vulnerable version, but rejects
-the fixed version identically, unable to relate a runtime clamp/bounds
-check to the buffer it protects. This is not a typo or an oversight — the
-corpus exists precisely to make that number improve (or regress)
-measurably as the verifier changes, not to claim it's already good.
+unbounded parameter — was caught by a real fix to the loop-fixpoint
+analysis's missing widening step. `libpng-cve-2018-13785` — a divisor
+provably nonzero via a `+ 1` term, safe from realistic 32-bit wraparound
+only because every other term is explicitly widened to 64 bits before
+multiplying, exactly matching C's own "usual arithmetic conversions" —
+was caught by extending the same divisor-safety check to recognize that
+pattern, deliberately WITHOUT trusting the identical shape when computed
+in native 32-bit arithmetic (the vulnerable version, which really does
+wrap to zero). Both verified sound against their own `must-reject/`
+mutants and the mutation/generated fuzzers, plus targeted adversarial
+tests distinguishing "explicitly widened" from "merely unsigned."
+`libwebp-cve-2023-4863` is **missed** — `ccc` accepts both the vulnerable
+and fixed versions outright, since the verifier does not yet track
+integer overflow. `libheif-overlay-85e21ad` is **false-positive** — `ccc`
+rejects the vulnerable version, but rejects the fixed version
+identically, unable to relate a runtime clamp/bounds check to the buffer
+it protects. This is not a typo or an oversight — the corpus exists
+precisely to make that number improve (or regress) measurably as the
+verifier changes, not to claim it's already good.
 
 An earlier version of this scoreboard briefly showed `libheif-overlay-85e21ad`
 as "detected", via a scoped heuristic that reasoned over unbounded

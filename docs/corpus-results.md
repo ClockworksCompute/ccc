@@ -1,9 +1,75 @@
 # CVE regression corpus — baseline results
 
+## 2026-09-19 (seventh update) — libpng-cve-2018-13785 DETECTED: extended
+## the divisor-safety check to recognize a widened, provably-nonzero sum
+## (FEL-77) — and a near-miss unsound version caught before shipping
+
+**Against commit:** (pending, this branch) on `main`.
+
+This entry's `false-positive` verdict was a genuine false positive on
+`fixed.c`: `row_factor`'s divisor-safety check couldn't see that
+`row_factor = (size_t)width * (size_t)channels * (bit_depth>8?2:1) + 1 +
+(interlaced?6:0)` is provably `>= 1` (the unconditional `+ 1`), because
+`resolveExprInt` (the only mechanism `isProvablyNonzero` had) requires
+the WHOLE expression to fold to one literal constant, which it never can
+— `width`/`channels`/etc. are runtime parameters.
+
+**The first version of this fix was unsound, caught before it shipped.**
+The natural-seeming fix — "every term in the sum is non-negative by
+TYPE (unsigned), so the sum is `>= 1`" — is WRONG: it mistakes "no term
+is individually negative" for "the arithmetic can't wrap", which are not
+the same claim. Testing it against `vulnerable.c` (not just `fixed.c`
+alone) immediately showed the mistake: `vulnerable.c`'s `row_factor` is
+computed ENTIRELY in native 32-bit `uint32_t` arithmetic — no cast
+anywhere — where `width * channels` alone can wrap past `0xFFFFFFFF`,
+and the following `+ 1` can then wrap the WHOLE expression back around to
+exactly 0 (`1431655765 * 3 = 4294967295`; `+ 1` wraps to `0`) — the exact
+mechanism CVE-2018-13785 exploits. The first fix would have wrongly
+accepted `vulnerable.c` too, silently re-introducing exactly the FEL-64
+class of mistake this project had already had to revert once.
+
+**The actual, sound fix** uses C's own "usual arithmetic conversions"
+rule as the distinguishing signal: a multiplication is only trusted to
+be free of realistic overflow when AT LEAST ONE operand is already known
+to live in a >= 64-bit-wide representation (an explicit `(size_t)`/
+`(long)` cast, transitively through another already-wide multiplication,
+or a literal) — exactly the "widen BEFORE multiplying" pattern `fixed.c`
+uses, and by the SAME C promotion rule a subsequent multiplication or
+addition against a narrower, un-cast value is automatically promoted too
+(so the trailing `(bit_depth>8?2:1)` ternary needs no cast of its own).
+`vulnerable.c` has no cast anywhere in the expression, so this never
+fires for it — confirmed directly, `vulnerable.c` is still correctly
+rejected.
+
+**Verification, beyond the paired corpus files themselves:**
+- Full regression suite: zero regressions (38/38 in
+  `VerifierFixesTest.lean`, 4 new cases for this fix, including the exact
+  narrow-vs-wide adversarial pair that caught the near-miss above, an
+  explicit-but-still-32-bit-cast case, and a widened-product-with-no-`+1`
+  case that must still be rejected).
+- `scripts/mutation_fuzz.py`: this entry's 4 comparison-operator mutants
+  all pass safely (`ok=4`), zero unsound.
+- `scripts/generated_fuzz.py`: no change in the templates unrelated to
+  this fix (array-bounds templates, touched by the separate FEL-76 fix).
+- Manual adversarial probes: an explicit `(uint32_t)` cast (still 32-bit)
+  is correctly NOT trusted; a wide cast on the SECOND multiplicand
+  instead of the first is correctly still trusted (matches real C
+  promotion regardless of operand order); removing the `+ 1` entirely
+  from an otherwise-fully-widened product is correctly still rejected
+  (the fix requires an actual proven bound `> 0`, not just "some operand
+  was widened").
+
+**Scoreboard**: `libpng-cve-2018-13785` is now **detected**. Current
+scoreboard: **2/4 detected** (`libpng-cve-2015-8126`,
+`libpng-cve-2018-13785`), **1 missed** (`libwebp-cve-2023-4863`,
+integer-overflow class), **1 false-positive** (`libheif-overlay-85e21ad`,
+needs real interprocedural relational reasoning this fix doesn't
+provide).
+
 ## 2026-09-19 (sixth update) — libpng-cve-2015-8126 DETECTED: fixed a real
 ## missing-widening bug in the loop-fixpoint analysis (FEL-76)
 
-**Against commit:** (pending, this branch) on `main`.
+**Against commit:** `b92e5aa` on `main`.
 
 The fifth update below reclassified this entry `false-positive` →
 `missed` after removing an incidental null-check masking issue. That

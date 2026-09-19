@@ -536,6 +536,81 @@ def main : IO UInt32 := do
      "int main() {\n  int arr[10];\n  fill(arr);\n  return arr[0];\n}\n")
   then pass := pass + 1
 
+  -- FEL-77: a division whose divisor is a variable initialized to a sum
+  -- that unconditionally includes `+ 1`, with every other term explicitly
+  -- widened to size_t before multiplying (matching real libpng's own
+  -- CVE-2018-13785 fix), is provably nonzero regardless of what those
+  -- other (runtime, attacker-influenced) terms are -- `resolveExprInt`
+  -- alone can never fold this (the terms aren't compile-time constants),
+  -- so this used to be an unconditional "cannot verify divisor is
+  -- nonzero" false positive.
+  total := total + 1
+  if ← expectClean "FEL77_widened_sum_plus_one_provably_nonzero"
+    ("typedef unsigned int uint32_t;\n" ++
+     "typedef unsigned long size_t;\n" ++
+     "int check(uint32_t width, uint32_t channels, uint32_t bit_depth, uint32_t interlaced, uint32_t height) {\n" ++
+     "  size_t row_factor = (size_t)width * (size_t)channels * (bit_depth > 8 ? 2 : 1) + 1 + (interlaced ? 6 : 0);\n" ++
+     "  if ((size_t)height > 0xFFFFFFFFUL / row_factor) { return 1; }\n" ++
+     "  return 0;\n" ++
+     "}\n" ++
+     "int main() { return check(1431655765u, 3, 8, 0, 100); }\n")
+  then pass := pass + 1
+
+  -- THE critical adversarial case a first (since-replaced) version of the
+  -- FEL-77 fix got wrong: the SAME "sum with a +1" shape, but computed
+  -- ENTIRELY in native 32-bit arithmetic with NO widening cast anywhere
+  -- (matching CVE-2018-13785's actual VULNERABLE shape) -- `width *
+  -- channels` alone can wrap past 0xFFFFFFFF, and the following `+ 1` can
+  -- then wrap the WHOLE expression back around to exactly 0. A naive
+  -- "unsigned type means every term is non-negative, so the sum is >= 1"
+  -- inference is UNSOUND here: it mistakes "no term is individually
+  -- negative" for "the arithmetic can't wrap", which are not the same
+  -- claim, and would silently re-introduce exactly the FEL-64 class of
+  -- mistake this project already had to revert once. This MUST still be
+  -- rejected.
+  total := total + 1
+  if ← expectCaught "FEL77_narrow_sum_plus_one_NOT_trusted_wraparound_risk"
+    ("typedef unsigned int uint32_t;\n" ++
+     "int check(uint32_t width, uint32_t channels, uint32_t bit_depth, uint32_t interlaced, uint32_t height) {\n" ++
+     "  uint32_t row_factor = width * channels * (bit_depth > 8 ? 2 : 1) + 1 + (interlaced ? 6 : 0);\n" ++
+     "  if (height > 0xFFFFFFFFU / row_factor) { return 1; }\n" ++
+     "  return 0;\n" ++
+     "}\n" ++
+     "int main() { return check(1431655765u, 3, 8, 0, 100); }\n")
+  then pass := pass + 1
+
+  -- An explicit cast that is STILL only 32 bits wide (`(uint32_t)`, not
+  -- `(size_t)`) must not be mistaken for a real widening cast either --
+  -- the presence of *a* cast is not the signal; the cast's TARGET width
+  -- is.
+  total := total + 1
+  if ← expectCaught "FEL77_explicit_but_still_narrow_cast_NOT_trusted"
+    ("typedef unsigned int uint32_t;\n" ++
+     "int check(uint32_t width, uint32_t channels) {\n" ++
+     "  uint32_t row_factor = (uint32_t)width * (uint32_t)channels + 1;\n" ++
+     "  if (100 > 0xFFFFFFFFU / row_factor) { return 1; }\n" ++
+     "  return 0;\n" ++
+     "}\n" ++
+     "int main() { return check(1431655765u, 3); }\n")
+  then pass := pass + 1
+
+  -- Without the `+ 1` safety margin at all, even a fully-widened product
+  -- genuinely CAN be zero (e.g. width=0) -- must still be rejected. Guards
+  -- against the inference being loosened to "any widened product is
+  -- automatically nonzero" rather than requiring an actual proven bound
+  -- strictly greater than zero.
+  total := total + 1
+  if ← expectCaught "FEL77_widened_product_without_plus_one_still_rejected"
+    ("typedef unsigned int uint32_t;\n" ++
+     "typedef unsigned long size_t;\n" ++
+     "int check(uint32_t width, uint32_t channels) {\n" ++
+     "  size_t row_factor = (size_t)width * (size_t)channels;\n" ++
+     "  if (100 > 0xFFFFFFFFUL / row_factor) { return 1; }\n" ++
+     "  return 0;\n" ++
+     "}\n" ++
+     "int main() { return check(0, 3); }\n")
+  then pass := pass + 1
+
   IO.println s!"\n═══ Results: {pass}/{total} passed ═══"
   if pass == total then
     IO.println "All verifier-fixes regression tests passed!"

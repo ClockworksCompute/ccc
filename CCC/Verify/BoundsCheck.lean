@@ -4,6 +4,24 @@ import CCC.Verify.Canon
 
 namespace CCC.Verify.BoundsCheck
 
+/-- FEL-77: resolve `typedef`/`const`/`volatile`/`restrict` wrappers down
+    to the underlying type, so a `uint32_t` (or any other unsigned
+    typedef) parameter is correctly recognized as unsigned by
+    `isUnsignedTy` below — this file never resolved typedefs before,
+    matching the same gap `PointerSafety.lean` had for its own
+    dereference check (fixed separately). Local here rather than shared,
+    same reasoning as that fix: avoids a cross-module dependency for one
+    use site. -/
+private partial def resolveTypedefTy (typedefs : List Syntax.TypedefDecl) (ty : Syntax.CType)
+    : Syntax.CType :=
+  match ty with
+  | .typedef_ name =>
+      match typedefs.find? (·.name == name) with
+      | some td => resolveTypedefTy typedefs td.target
+      | none => ty
+  | .const_ inner | .volatile_ inner | .restrict_ inner => resolveTypedefTy typedefs inner
+  | _ => ty
+
 private def exprName (expr : Syntax.Expr) : String :=
   match expr with
   | .var name _ => name
@@ -579,16 +597,120 @@ private def applyScalarIncDec (op : Syntax.UnOp) (operand : Syntax.Expr) (state 
       | some _, none => (state.clearRange key).clearNonZero key
       | none, _ => state
 
+/-- Is this type at least 64 bits wide (`size_t`, `long`, `long long`, a
+    pointer, or `unsigned` wrapping one of those)? Used ONLY to decide
+    whether a multiplication is safe from realistic 32-bit wraparound —
+    see `inferNonNegBoundWide` below. Deliberately does NOT include plain
+    `int`/`unsigned int`/`uint32_t`-class 32-bit types, even though
+    they're often called "wide enough" casually — CVE-2018-13785 is
+    exactly a 32-bit multiply overflowing, so 32-bit must never count as
+    safe here. -/
+private def isWideIntTy (ty : Syntax.CType) : Bool :=
+  match ty with
+  | .sizeT | .long | .longLong => true
+  | .unsigned inner => isWideIntTy inner
+  | .pointer _ => true
+  | _ => false
+
+/-- FEL-77: a SOUND, deliberately narrow lower-bound inference for a sum
+    expression, used only when `resolveExprInt` can't fully constant-fold
+    it (a real, common shape libpng's own overflow fix uses: `row_factor
+    = (size_t)width * (size_t)channels * (bit_depth>8?2:1) + 1 +
+    (interlaced?6:0);` — `width`/`channels`/etc. are runtime parameters,
+    so the WHOLE expression can never resolve to one literal, but the
+    unconditional `+ 1` makes the whole sum provably `>= 1` regardless of
+    what those parameters are, since every other term is non-negative).
+
+    The FIRST version of this function (since replaced) treated a sum's
+    non-negativity as true "by type" alone, with no regard for whether
+    the arithmetic could realistically WRAP AROUND within the type's own
+    bit width before the addition ever happens. That is exactly how
+    CVE-2018-13785 itself works: `vulnerable.c`'s `row_factor` is
+    computed ENTIRELY in native `uint32_t` (32-bit) arithmetic — `width *
+    channels` alone can wrap past `0xFFFFFFFF`, and the following `+ 1`
+    can then wrap the WHOLE expression back around to exactly 0. The
+    first version of this fix would have WRONGLY inferred `row_factor >=
+    1` for `vulnerable.c` too (mistaking "the type is unsigned, so no
+    term is negative" for "the arithmetic can't wrap", which are not the
+    same claim) — silently re-introducing exactly the FEL-64 class of
+    mistake this project had already had to revert once. Caught before
+    shipping by testing the paired `vulnerable.c`/`fixed.c` corpus files
+    together, not `fixed.c` alone.
+
+    The actual distinguishing, SOUND signal is C's own "usual arithmetic
+    conversions" rule: a multiplication is safe from realistic overflow
+    only when at least one operand's own value is already known to live
+    in a >= 64-bit-wide representation (an explicit `(size_t)`/`(long)`
+    cast, transitively through another already-wide multiplication or a
+    plain literal) — exactly the "widen BEFORE multiplying" pattern
+    `fixed.c`'s real upstream fix uses, and BY THE SAME C PROMOTION RULE
+    a subsequent multiplication or addition against a narrower value (an
+    un-cast ternary literal, say) is automatically promoted too, so it
+    doesn't need its own explicit cast. `vulnerable.c` has NO cast
+    anywhere in the expression, so this never fires for it.
+
+    Returns `(lowerBound, isWide)`: `isWide` says whether that bound is
+    itself trustworthy input to a FURTHER multiplication (a plain
+    narrow-typed variable's own bound is never `isWide`, even when known
+    non-negative, so a chain of un-widened multiplications can never
+    accumulate false confidence). -/
+private partial def inferNonNegBoundWide (ctx : VerifyCtx) (state : FlowState)
+    (expr : Syntax.Expr) : Option Int × Bool :=
+  match expr with
+  | .intLit v _ => (if v ≥ 0 then some v else none, true)
+  | .charLit c _ => (some (Int.ofNat c.toNat), true)
+  | .cast ty operand _ =>
+      let (innerBound, _) := inferNonNegBoundWide ctx state operand
+      let isWide := isWideIntTy (resolveTypedefTy ctx.program.typedefs ty)
+      let bound := match innerBound with
+        | some b => some b
+        | none => if isWide then some 0 else none
+      (bound, isWide)
+  | .var name _ =>
+      match (state.getRange name).bind (·.lo) with
+      | some a => (some a, false)
+      | none =>
+          match state.getType name with
+          | some ty => (if isUnsignedTy (resolveTypedefTy ctx.program.typedefs ty) then some 0 else none, false)
+          | none => (none, false)
+  | .binOp .add lhs rhs _ =>
+      let (a, aw) := inferNonNegBoundWide ctx state lhs
+      let (b, bw) := inferNonNegBoundWide ctx state rhs
+      match a, b with
+      | some x, some y => (some (x + y), aw && bw)
+      | _, _ => (none, false)
+  | .binOp .mul lhs rhs _ =>
+      let (a, aw) := inferNonNegBoundWide ctx state lhs
+      let (b, bw) := inferNonNegBoundWide ctx state rhs
+      match a, b with
+      | some x, some y =>
+          if (aw || bw) && x ≥ 0 && y ≥ 0 then (some (x * y), true) else (none, false)
+      | _, _ => (none, false)
+  | .ternary _ t e _ =>
+      let (a, aw) := inferNonNegBoundWide ctx state t
+      let (b, bw) := inferNonNegBoundWide ctx state e
+      match a, b with
+      | some x, some y => (some (min x y), aw && bw)
+      | _, _ => (none, false)
+  | _ => (resolveExprInt ctx expr, true)
+
 /-- Called for a `varDecl` initializer: seeds a point range when the
-    initializer resolves to a known integer, otherwise leaves it unknown
-    (never clears — the variable has no prior tracked range to go stale). -/
+    initializer resolves to a known integer; otherwise falls back to
+    `inferNonNegBoundWide` for a sound (possibly-unknown-hi) lower bound
+    (FEL-77); otherwise leaves it unknown (never clears — the variable
+    has no prior tracked range to go stale). -/
 def applyDeclRange (ctx : VerifyCtx) (name : String) (init : Syntax.Expr) (state : FlowState)
     : FlowState :=
   match resolveExprInt ctx init with
   | some v =>
       let s1 := state.setRange name (IRange.point v)
       if v != 0 then s1.setNonZero name else s1.clearNonZero name
-  | none => state
+  | none =>
+      match (inferNonNegBoundWide ctx state init).1 with
+      | some lo =>
+          let s1 := state.setRange name (IRange.unknown.withLo lo)
+          if lo > 0 then s1.setNonZero name else s1
+      | none => state
 
 /-- Bounds checks over expressions (array index, memcpy-shaped sinks, and
     range invalidation/update on writes). -/
