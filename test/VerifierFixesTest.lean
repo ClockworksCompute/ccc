@@ -611,6 +611,80 @@ def main : IO UInt32 := do
      "int main() { return check(0, 3); }\n")
   then pass := pass + 1
 
+  -- FEL-45 reopen (2026-09-19 review): a memcpy-shaped sink whose
+  -- DESTINATION size cannot be determined statically (a bare pointer
+  -- parameter, not an array or a known allocation) used to silently pass
+  -- with 0 violations -- exactly the shape that masked the ticket's
+  -- original example, `void copy(char *dst, char *src, int n)`.
+  total := total + 1
+  if ← expectCaught "FEL45_memcpy_unknown_dest_size_now_caught"
+    ("void copy(char *dst, char *src, int n) {\n" ++
+     "  memcpy(dst, src, n);\n" ++
+     "}\n" ++
+     "int main() { char a[8]; char b[8]; copy(a, b, 4); return 0; }\n")
+  then pass := pass + 1
+
+  -- Regression guard: memcpy between two arrays of statically-known size,
+  -- with a length that provably fits both, must remain clean.
+  total := total + 1
+  if ← expectClean "FEL45_memcpy_known_sizes_still_clean"
+    "int main() {\n  char dst[16];\n  char src[8];\n  memcpy(dst, src, 8);\n  return 0;\n}"
+  then pass := pass + 1
+
+  -- Same unknown-destination gap for the single-buffer sinks (memset was
+  -- already in the table, but only checked when the destination size WAS
+  -- known -- an unknown one fell through unchanged).
+  total := total + 1
+  if ← expectCaught "FEL45_memset_unknown_dest_size_now_caught"
+    "void clear(char *p, int n) {\n  memset(p, 0, n);\n  return;\n}\n"
+  then pass := pass + 1
+
+  -- FEL-45 reopen: fread/read/fgets/vsnprintf newly added to the sink
+  -- table (same (dst, len) shape as memset/strncpy/snprintf); each must
+  -- now be checked rather than passed through unmodelled.
+  total := total + 1
+  if ← expectCaught "FEL45_fread_unknown_dest_size_caught"
+    ("typedef unsigned long size_t;\n" ++
+     "extern size_t fread(void *ptr, size_t size, size_t nmemb, void *stream);\n" ++
+     "void load(char *buf, void *f) {\n  fread(buf, 1, 1000, f);\n}\n" ++
+     "int main() { char b[8]; load(b, 0); return 0; }\n")
+  then pass := pass + 1
+
+  total := total + 1
+  if ← expectCaught "FEL45_read_unknown_dest_size_caught"
+    ("extern long read(int fd, void *buf, unsigned long count);\n" ++
+     "void recvAll(int fd, char *buf, int n) {\n  read(fd, buf, n);\n}\n" ++
+     "int main() { char b[8]; recvAll(0, b, 4); return 0; }\n")
+  then pass := pass + 1
+
+  total := total + 1
+  if ← expectCaught "FEL45_fgets_unknown_dest_size_caught"
+    ("extern char *fgets(char *s, int size, void *stream);\n" ++
+     "void readLine(char *buf, int n, void *f) {\n  fgets(buf, n, f);\n}\n" ++
+     "int main() { char b[8]; readLine(b, 8, 0); return 0; }\n")
+  then pass := pass + 1
+
+  total := total + 1
+  if ← expectCaught "FEL45_vsnprintf_unknown_dest_size_caught"
+    ("typedef unsigned long size_t;\n" ++
+     "typedef struct __va_list_tag *va_list;\n" ++
+     "extern int vsnprintf(char *s, size_t n, const char *fmt, va_list ap);\n" ++
+     "void fmtInto(char *buf, int n, const char *fmt, va_list ap) {\n" ++
+     "  vsnprintf(buf, n, fmt, ap);\n" ++
+     "}\n" ++
+     "int main() { return 0; }\n")
+  then pass := pass + 1
+
+  -- strncat's destination needs room for its EXISTING content plus n+1
+  -- bytes, which this verifier does not track at all -- must always be
+  -- flagged, even with a statically-sized, plausibly-large-enough buffer,
+  -- since "large enough for what's already in it" is exactly what cannot
+  -- be verified.
+  total := total + 1
+  if ← expectCaught "FEL45_strncat_always_flagged"
+    "int main() {\n  char buf[64] = \"hello\";\n  strncat(buf, \" world\", 6);\n  return 0;\n}"
+  then pass := pass + 1
+
   IO.println s!"\n═══ Results: {pass}/{total} passed ═══"
   if pass == total then
     IO.println "All verifier-fixes regression tests passed!"

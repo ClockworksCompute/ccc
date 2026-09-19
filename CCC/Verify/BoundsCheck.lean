@@ -359,9 +359,24 @@ private def checkIndexAccess (ctx : VerifyCtx) (arr idx fullExpr : Syntax.Expr)
 -- fits; sprintf/gets always flagged as inherently unboundable.
 -- ══════════════════════════════════════════════════════════════
 
+private def sizeDesc (sz? : Option Nat) : String :=
+  match sz? with
+  | some n => toString n
+  | none => "unknown"
+
+/-- FEL-45 reopen (2026-09-19 review): a sink whose destination (or, for
+    the two-buffer sinks, source) size cannot be determined statically used
+    to fall through this match unchanged and pass with 0 violations --
+    exactly as dangerous as an unmodelled sink, since `void copy(char *dst,
+    char *src, int n) { memcpy(dst, src, n); }` is an extremely common real
+    shape (the size lives with the CALLER, not this function). Until FEL-48/58
+    give callers a way to discharge this via a summary/`requires` clause,
+    "size unknown" must report "cannot verify", not silently accept. -/
 private def checkCopyCall (ctx : VerifyCtx) (fnName : String) (dst src len fullExpr : Syntax.Expr)
     (loc : Syntax.Loc) (state : FlowState) : FlowState :=
-  match bufferSizeBytes? ctx state dst, bufferSizeBytes? ctx state src with
+  let dstSize? := bufferSizeBytes? ctx state dst
+  let srcSize? := bufferSizeBytes? ctx state src
+  match dstSize?, srcSize? with
   | some dstSize, some srcSize =>
       match lengthBoundInclusive? ctx state len with
       | some lenInc =>
@@ -377,7 +392,11 @@ private def checkCopyCall (ctx : VerifyCtx) (fnName : String) (dst src len fullE
             (mkBufSinkViolation ctx loc fullExpr fnName
               s!"Cannot verify {fnName} length against buffers (dst={dstSize}, src={srcSize})"
               "Prove len is bounded by both source and destination buffer sizes")
-  | _, _ => state
+  | _, _ =>
+      state.addViolation
+        (mkBufSinkViolation ctx loc fullExpr fnName
+          s!"Cannot verify {fnName} length against destination (size {sizeDesc dstSize?}) or source (size {sizeDesc srcSize?}) -- buffer size unknown"
+          "Buffer size could not be determined statically (e.g. a bare pointer parameter); prove it via an array type or a sized allocation")
 
 private def checkSingleBufLenCall (ctx : VerifyCtx) (fnName : String) (dst len fullExpr : Syntax.Expr)
     (loc : Syntax.Loc) (state : FlowState) : FlowState :=
@@ -397,7 +416,11 @@ private def checkSingleBufLenCall (ctx : VerifyCtx) (fnName : String) (dst len f
             (mkBufSinkViolation ctx loc fullExpr fnName
               s!"Cannot verify {fnName} length against destination buffer (dst={dstSize})"
               "Prove len is bounded by the destination buffer size")
-  | none => state
+  | none =>
+      state.addViolation
+        (mkBufSinkViolation ctx loc fullExpr fnName
+          s!"Cannot verify {fnName} length against destination -- buffer size unknown"
+          "Destination buffer size could not be determined statically (e.g. a bare pointer parameter); prove it via an array type or a sized allocation")
 
 private def checkLiteralFitsCall (ctx : VerifyCtx) (fnName : String) (dst src fullExpr : Syntax.Expr)
     (loc : Syntax.Loc) (state : FlowState) : FlowState :=
@@ -774,6 +797,25 @@ partial def checkExpr (ctx : VerifyCtx) (expr : Syntax.Expr) (state : FlowState)
             (mkBufSinkViolation ctx loc expr "gets"
               "gets() cannot bound input length and is inherently unsafe"
               "Use fgets with an explicit buffer size instead")
+      -- FEL-45 reopen: fread/read/recv/fgets/vsnprintf added to the sink
+      -- table (same (dst, len) shape as memset/strncpy/snprintf above);
+      -- fread's length is the product of its size/nmemb args.
+      | "fread", [dst, elemSize, nmemb, _stream] =>
+          checkSingleBufLenCall ctx "fread" dst (Syntax.Expr.binOp .mul elemSize nmemb loc) expr loc s1
+      | "read", [_fd, dst, len] => checkSingleBufLenCall ctx "read" dst len expr loc s1
+      | "recv", [_fd, dst, len, _flags] => checkSingleBufLenCall ctx "recv" dst len expr loc s1
+      | "fgets", [dst, size, _stream] => checkSingleBufLenCall ctx "fgets" dst size expr loc s1
+      | "vsnprintf", (dst :: len :: _rest) => checkSingleBufLenCall ctx "vsnprintf" dst len expr loc s1
+      -- strncat's destination must have room for its EXISTING content plus
+      -- n+1 bytes; this verifier tracks no notion of a buffer's current
+      -- used length (only its total capacity), so there is no sound way to
+      -- accept this call at all -- always "cannot verify", same treatment
+      -- as sprintf/gets above.
+      | "strncat", [_dst, _src, _n] =>
+          s1.addViolation
+            (mkBufSinkViolation ctx loc expr "strncat"
+              "strncat's destination must have room for its existing content plus n+1 bytes, which is not tracked -- cannot verify"
+              "Use snprintf to build the string instead, or restructure to avoid appending to a live buffer")
       | _, _ => s1
   | .assign lhs rhs _ =>
       let s1 := checkExpr ctx lhs state
