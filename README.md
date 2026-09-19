@@ -269,6 +269,40 @@ statements, a second smaller call site, reassign a size variable) needs
 real C-aware transformations a token-regex mutator can't do safely, and
 is tracked as follow-up work under that same ticket.
 
+### Generated-program fuzzer (FEL-69)
+
+`scripts/generated_fuzz.py` covers FEL-69's other build item: rather than
+perturbing the existing corpus, it generates fresh, small, parameterized
+C programs from a fixed set of templates (a fixed-size local array, a
+`malloc`'d heap array, a struct-field array accessed through a pointer,
+a copy loop between two independently-sized buffers), each instantiated
+with randomized buffer sizes and loop bounds so both safe and unsafe
+instances of the same shape get exercised. Same differential oracle as
+the mutation fuzzer. Run a fixed number of instances, or for a duration:
+
+```bash
+lake build ccc
+python3 scripts/generated_fuzz.py --iterations 200
+python3 scripts/generated_fuzz.py --duration-secs 3600   # sustained run
+```
+
+A finding is written to a temp directory (never into the repo — there is
+no single existing corpus entry to file a generated program's finding
+into the way the mutation fuzzer does) and printed with a `::warning::`.
+As of this writing every finding traces to one already-tracked, not yet
+fixed gap (a fixed-capacity buffer written in a loop bounded by an
+ordinary, unbounded parameter — filed as a ticket in the project
+tracker), not a new bug class; this tool's value is in quantifying that
+gap's real-world frequency across randomized parameters and guarding
+against regressing it once fixed.
+
+`.github/workflows/nightly-fuzz.yml` runs both fuzzers on a schedule
+(nightly, plus manual `workflow_dispatch` with a configurable duration),
+separate from the fast on-push CI, matching FEL-69's own design of a
+smoke run on every push and a sustained nightly run. A single scheduled
+run cannot itself claim a "24-hour clean" result — that's a property of
+many such runs accumulating clean over real wall-clock time.
+
 ## Project structure
 
 ```

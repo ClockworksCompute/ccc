@@ -1,0 +1,76 @@
+name: Nightly soundness fuzzing (FEL-69)
+
+# FEL-69's own design: "CI: a 10-minute smoke run on every push; a nightly
+# 6h run; the epic's bullet 3 is a 24h clean run." scripts/mutation_fuzz.py
+# (wired into the main push-triggered ci.yml already) is the smoke run;
+# this workflow is the sustained one. A single invocation of this workflow
+# cannot itself CLAIM the epic's 24h-clean bullet -- that's a property of
+# many such runs accumulating clean over real wall-clock time, not
+# something one job proves. Defaults to a 1-hour duration per run
+# (comfortably inside hosted-runner limits); `workflow_dispatch` lets
+# anyone kick off a longer run manually (e.g. toward the 6h nightly figure)
+# without editing this file.
+on:
+  schedule:
+    - cron: '17 3 * * *'   # nightly, off the hour to avoid GitHub's peak-load slot
+  workflow_dispatch:
+    inputs:
+      duration_secs:
+        description: 'Fuzzing duration in seconds (per fuzzer)'
+        required: false
+        default: '3600'
+
+jobs:
+  nightly-fuzz:
+    runs-on: macos-14
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install elan (Lean toolchain manager)
+        run: |
+          curl https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh -sSf | sh -s -- -y --default-toolchain none
+          echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
+
+      - name: Cache Lake build
+        uses: actions/cache@v4
+        with:
+          path: .lake
+          key: lake-${{ runner.os }}-${{ hashFiles('lean-toolchain', 'lakefile.lean', 'lake-manifest.json') }}-${{ github.sha }}
+          restore-keys: |
+            lake-${{ runner.os }}-${{ hashFiles('lean-toolchain', 'lakefile.lean', 'lake-manifest.json') }}-
+
+      - name: Build ccc
+        run: lake build ccc
+
+      - name: Run mutation fuzzer (comparison-operator-flip class)
+        run: python3 scripts/mutation_fuzz.py | tee mutation-fuzz-nightly-report.txt
+
+      - name: Run generated-program fuzzer
+        run: |
+          DURATION="${{ github.event.inputs.duration_secs || '3600' }}"
+          python3 scripts/generated_fuzz.py --duration-secs "$DURATION" | tee generated-fuzz-nightly-report.txt
+
+      - name: Summarize
+        if: always()
+        run: |
+          {
+            echo "## Nightly soundness fuzzing (FEL-69)"
+            echo "### Mutation fuzzer"
+            echo '```'
+            cat mutation-fuzz-nightly-report.txt
+            echo '```'
+            echo "### Generated-program fuzzer"
+            echo '```'
+            cat generated-fuzz-nightly-report.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nightly-fuzz-reports
+          path: |
+            mutation-fuzz-nightly-report.txt
+            generated-fuzz-nightly-report.txt
