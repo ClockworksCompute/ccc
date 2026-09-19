@@ -169,7 +169,23 @@ partial def emitArmLValueAddr (env : TypeEnv) (expr : Expr) : ArmCodegenM CType 
               emitArmInstr (.adrp .x0 s!"_{name}")
               emitArmInstr (.add_sym .x0 .x0 s!"_{name}")
               pure ty
-          | none => throw s!"unknown variable '{name}'"
+          | none =>
+              -- FEL-68: a bare function name (`add`, or `&add`) decays to
+              -- its address — the same "function-to-pointer" rule C
+              -- already applies for arrays-to-pointer. Needed for
+              -- callback-table patterns real C libraries use constantly
+              -- (zlib's `alloc_func`/`free_func`, qsort comparators):
+              -- `op_t p = add;` previously failed emission OUTRIGHT with
+              -- "unknown variable 'add'", since functions were never
+              -- registered in `globalNames`. `funcParamTypes` (already
+              -- built program-wide for the AAPCS64 stack-args work)
+              -- doubles as the "is this name a known function" table.
+              match st.funcParamTypes.find? (·.1 == name) with
+              | some (_, paramTys) =>
+                  emitArmInstr (.adrp .x0 s!"_{name}")
+                  emitArmInstr (.add_sym .x0 .x0 s!"_{name}")
+                  pure (.funcPtr .long paramTys)
+              | none => throw s!"unknown variable '{name}'"
       | some off =>
           emitAddOrSubImm .x0 .x29 off
           match lookupVarType env name with
@@ -283,7 +299,16 @@ partial def emitArmExpr (env : TypeEnv) (expr : Expr) : ArmCodegenM Unit := do
               match ty with
               | .array _ _ => pure ()  -- array decays to pointer (address already in x0)
               | _ => emitArmLoadFromAddr ty
-          | none => throw s!"unknown variable '{name}'"
+          | none =>
+              -- FEL-68: function-name-to-pointer decay, rvalue side —
+              -- see the matching case in `emitArmLValueAddr` for the
+              -- full rationale. The function's address IS the value
+              -- here (no load-from-address, unlike an ordinary global).
+              match st.funcParamTypes.find? (·.1 == name) with
+              | some _ =>
+                  emitArmInstr (.adrp .x0 s!"_{name}")
+                  emitArmInstr (.add_sym .x0 .x0 s!"_{name}")
+              | none => throw s!"unknown variable '{name}'"
       | some off =>
           let ty := match lookupVarType env name with
             | some t => t
@@ -625,14 +650,26 @@ partial def emitArmExpr (env : TypeEnv) (expr : Expr) : ArmCodegenM Unit := do
         for e in elems do
           emitArmExpr env e
   | .callFnPtr fnExpr args _ =>
+      -- FEL-68: the function-pointer expression must be evaluated and
+      -- saved BEFORE argument evaluation, and popped into a
+      -- non-argument scratch register (`x9`) rather than `x0` right
+      -- before `blr` — evaluating `fnExpr` last (the previous order)
+      -- clobbered `x0`, which by then already held the fully-evaluated
+      -- first ARGUMENT, silently corrupting every indirect call taking
+      -- at least one argument. Pushing `fnExpr`'s value first and
+      -- popping it last (after all N argument pops) is correct
+      -- regardless of N, since a stack is strictly LIFO: it is always
+      -- the deepest item.
+      emitArmExpr env fnExpr
+      emitArmPush .x0
       for arg in args.reverse do
         emitArmExpr env arg
         emitArmPush .x0
       let regsToUse := (armArgRegs.take args.length)
       for reg in regsToUse do
         emitArmPop reg
-      emitArmExpr env fnExpr
-      emitArmInstr (.blr .x0)
+      emitArmPop .x9
+      emitArmInstr (.blr .x9)
   | .nullLit _ => emitArmInstr (.mov_imm .x0 0)
   | .floatLit _ _ => emitArmInstr (.mov_imm .x0 0)
 
@@ -703,48 +740,80 @@ partial def emitArmCompoundAssign (env : TypeEnv) (lhs : Expr) (rhs : Expr) (op 
     first 8) are evaluated and handled afterwards via the pre-existing
     push-then-pop-in-reverse pattern, itself balanced too. -/
 partial def emitArmCall (env : TypeEnv) (fn : String) (args : List Expr) : ArmCodegenM Unit := do
-  let nRegArgs := min args.length armArgRegs.length
-  let regArgs := args.take nRegArgs
-  let stackArgs := args.drop nRegArgs
-  if !stackArgs.isEmpty then
-    let st ← get
-    -- Prefer the callee's own declared parameter types (see
-    -- `funcParamTypes`'s docstring on why); fall back to inferring each
-    -- argument expression's type only when the callee isn't known or
-    -- doesn't declare enough parameters for this position.
-    let declared? := (st.funcParamTypes.find? (·.1 == fn)).map (·.2 |>.drop nRegArgs)
-    let stackTypes := match declared? with
-      | some declTys =>
-          if declTys.length == stackArgs.length then
-            declTys.map (resolveType st.typedefs)
-          else
-            stackArgs.map (fun a => resolveType st.typedefs (inferExprType env st.structDefs a))
-      | none => stackArgs.map (fun a => resolveType st.typedefs (inferExprType env st.structDefs a))
-    let (offsets, packedSize) := Layout.packedOffsets st.structDefs stackTypes
-    let stackBytes := roundUp16 packedSize
-    emitArmInstr (.sub_imm .sp .sp (Int.ofNat stackBytes))
-    for ((arg, ty), off) in stackArgs.zip stackTypes |>.zip offsets do
-      emitArmExpr env arg
-      emitArmStoreWidth .x0 .sp (Int.ofNat off) (cTypeSize st.structDefs ty)
-    -- Evaluate each register arg and push onto stack
-    for arg in regArgs do
+  let st0 ← get
+  -- FEL-68: `f(x, y)` where `f` is a LOCAL variable (parameter or
+  -- local) holding a function pointer — not a named top-level function
+  -- — is syntactically indistinguishable from a direct call at parse
+  -- time (both parse as `.call fn args`; see `parsePostfix`'s `.lparen`
+  -- case, which only special-cases an explicit `(*fp)(...)` deref as
+  -- `.callFnPtr`). Real C libraries lean on this pattern constantly for
+  -- callbacks (zlib's `alloc_func`/`free_func`, qsort comparators) —
+  -- previously this always emitted a direct `bl _f`, which either
+  -- linked to an unrelated same-named global function or (as here)
+  -- failed to link at all with "symbol not found", since no function
+  -- named `f` exists. A local variable named `fn` always wins (matches
+  -- C's ordinary scoping — a parameter shadows a same-named global
+  -- function), so it is resolved here as an indirect call: load the
+  -- pointer value, then `blr`, exactly like an explicit `(*fp)(...)`
+  -- call already does.
+  if (lookupOffset st0.localOffsets fn).isSome then
+    -- Same push-fn-ptr-first, pop-into-scratch-last ordering as
+    -- `.callFnPtr` above, and for the same reason: loading the
+    -- function-pointer value into `x0` right before `blr` would clobber
+    -- the already-evaluated first argument.
+    emitArmExpr env (.var fn ⟨0, 0⟩)
+    emitArmPush .x0
+    for arg in args.reverse do
       emitArmExpr env arg
       emitArmPush .x0
-    let regsToUse := (armArgRegs.take nRegArgs).reverse
+    let regsToUse := armArgRegs.take args.length
     for reg in regsToUse do
       emitArmPop reg
-    emitArmInstr (.bl (builtinName fn))
-    emitArmInstr (.add_imm .sp .sp (Int.ofNat stackBytes))
+    emitArmPop .x9
+    emitArmInstr (.blr .x9)
   else
-    -- Evaluate each register arg and push onto stack
-    for arg in regArgs do
-      emitArmExpr env arg
-      emitArmPush .x0
-    -- Pop into argument registers in reverse order
-    let regsToUse := (armArgRegs.take nRegArgs).reverse
-    for reg in regsToUse do
-      emitArmPop reg
-    emitArmInstr (.bl (builtinName fn))
+    let nRegArgs := min args.length armArgRegs.length
+    let regArgs := args.take nRegArgs
+    let stackArgs := args.drop nRegArgs
+    if !stackArgs.isEmpty then
+      let st ← get
+      -- Prefer the callee's own declared parameter types (see
+      -- `funcParamTypes`'s docstring on why); fall back to inferring each
+      -- argument expression's type only when the callee isn't known or
+      -- doesn't declare enough parameters for this position.
+      let declared? := (st.funcParamTypes.find? (·.1 == fn)).map (·.2 |>.drop nRegArgs)
+      let stackTypes := match declared? with
+        | some declTys =>
+            if declTys.length == stackArgs.length then
+              declTys.map (resolveType st.typedefs)
+            else
+              stackArgs.map (fun a => resolveType st.typedefs (inferExprType env st.structDefs a))
+        | none => stackArgs.map (fun a => resolveType st.typedefs (inferExprType env st.structDefs a))
+      let (offsets, packedSize) := Layout.packedOffsets st.structDefs stackTypes
+      let stackBytes := roundUp16 packedSize
+      emitArmInstr (.sub_imm .sp .sp (Int.ofNat stackBytes))
+      for ((arg, ty), off) in stackArgs.zip stackTypes |>.zip offsets do
+        emitArmExpr env arg
+        emitArmStoreWidth .x0 .sp (Int.ofNat off) (cTypeSize st.structDefs ty)
+      -- Evaluate each register arg and push onto stack
+      for arg in regArgs do
+        emitArmExpr env arg
+        emitArmPush .x0
+      let regsToUse := (armArgRegs.take nRegArgs).reverse
+      for reg in regsToUse do
+        emitArmPop reg
+      emitArmInstr (.bl (builtinName fn))
+      emitArmInstr (.add_imm .sp .sp (Int.ofNat stackBytes))
+    else
+      -- Evaluate each register arg and push onto stack
+      for arg in regArgs do
+        emitArmExpr env arg
+        emitArmPush .x0
+      -- Pop into argument registers in reverse order
+      let regsToUse := (armArgRegs.take nRegArgs).reverse
+      for reg in regsToUse do
+        emitArmPop reg
+      emitArmInstr (.bl (builtinName fn))
 
 end
 

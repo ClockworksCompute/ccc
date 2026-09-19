@@ -60,7 +60,7 @@ jobs:
                    VerifyAllDemos ParseAllDemos PreprocessElifTest EmitAndRun \
                    MacroTest MacroTest2 MacroTest3 SignednessTest \
                    VerifierFixesTest HardenTest StructLayoutTest StackArgsTest \
-                   GlobalArrayTest EnumResolveTest; do
+                   GlobalArrayTest EnumResolveTest FuncPtrTest; do
             echo "::group::$t"
             if ! lake env lean --run "test/$t.lean"; then
               echo "::error::$t FAILED"
